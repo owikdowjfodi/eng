@@ -413,7 +413,10 @@
         </div>
         <button id="btn-search" class="duo-btn sm:w-36">查詢 🔎</button>
       </div>
-      <p class="mt-3 text-xs text-[#AFAFAF] font-bold text-center sm:text-left">💡 按 Enter 也可以直接查詢。資料來源：Wiktionary 開放語料庫＋Datamuse＋線上翻譯，查過的字會存進本機快取。</p>
+      <p class="mt-3 text-xs text-[#AFAFAF] font-bold text-center sm:text-left">💡 按 Enter 也可以直接查詢。可查<b class="text-[#1CB0F6]">單字</b>、<b class="text-[#CE82FF]">習語（如 bite the bullet）</b>或<b class="text-[#FF9600]">整句翻譯</b>；拼錯字會自動幫你修正。</p>
+
+      <!-- ★ 新增：輸入即時拆字感應（打字就開始拆，不必等查詢） -->
+      <div id="live-analysis" class="mt-3"></div>
 
       <!-- 連線狀態列 -->
       <div class="mt-4 flex flex-wrap items-center gap-2 justify-center sm:justify-start">
@@ -424,6 +427,9 @@
 
       <!-- 快速範例 -->
       <div class="mt-4 flex flex-wrap gap-2 justify-center sm:justify-start" id="quick-words"></div>
+
+      <!-- ★ 新增：最近查詢紀錄 -->
+      <div id="search-history" class="mt-3"></div>
     </div>
 
     <!-- 查詢結果 -->
@@ -509,11 +515,12 @@ const DAILY_QUIZ_SIZE = 5;               // 每日測驗題數
 const MINUTES_PER_DAY = 24 * 60;         // 倒數計時換算用
 
 const LS_KEYS = {
-  WRONG:  'wrong_words_db',        // 錯題資料庫（規格指定名稱）
-  DAILY:  'daily_quiz_record',     // 每日測驗紀錄
-  STATS:  'learning_stats',        // 學習統計
-  CACHE:  'dict_cache',            // ★ 連網查詢結果快取（單字 → 完整資料）
-  ZH:     'zh_meaning_cache'       // ★ 繁體中文短釋義快取（出題用，最輕量）
+  WRONG:   'wrong_words_db',       // 錯題資料庫（規格指定名稱）
+  DAILY:   'daily_quiz_record',    // 每日測驗紀錄（★ 多輪次格式：{date, sessions[], usedWords[]}）
+  STATS:   'learning_stats',       // 學習統計
+  CACHE:   'dict_cache',           // ★ 連網查詢結果快取（單字 → 完整資料）
+  ZH:      'zh_meaning_cache',     // ★ 繁體中文短釋義快取（出題用，最輕量）
+  HISTORY: 'search_history'        // ★ 最近查詢紀錄（單字／習語／句子）
 };
 
 /* =================================================================================
@@ -542,6 +549,9 @@ const CACHE_MAX_ITEMS   = 400;                        // 快取上限（超過�
 const QUIZ_POOL_FETCH   = 15;                         // 每日測驗最多連網抓取幾個字的釋義（其餘靠快取）
 const MAX_HISTORY_CHARS = 700;                        // 語源原文最長保留長度
 const FETCH_CONCURRENCY = 5;                          // 同時連線數上限
+const HISTORY_MAX_ITEMS = 12;                          // ★ 最近查詢紀錄最多保留幾筆
+const LIVE_ANALYSIS_DELAY_MS = 320;                    // ★ 輸入即時拆字的防抖延遲（毫秒）
+const PHRASE_MAX_CHARS = 200;                          // ★ 習語／句子輸入長度上限
 
 /** 詞性英文 → 繁體中文對照 */
 const POS_ZH = {
@@ -580,9 +590,10 @@ const WORD_POOL = [
 /** 去重並轉小寫，避免清單手誤 */
 const QUIZ_WORDS = Array.from(new Set(WORD_POOL.map(w => String(w).toLowerCase())));
 
-/** 查詢結果卡上顯示的快速範例 */
+/** 查詢結果卡上顯示的快速範例（★ 後三個是習語，用來展示「整組解釋、不拆字」） */
 const QUICK_WORDS = ['contradict', 'autobiography', 'geography', 'retrospect', 'bicycle',
-  'inspection', 'predictable', 'telepathy', 'sympathy', 'invisible', 'transport', 'manuscript'];
+  'inspection', 'predictable', 'telepathy', 'sympathy', 'invisible', 'transport', 'manuscript',
+  'bite the bullet', 'break the ice', 'piece of cake'];
 
 /** 取得某份測驗的題數（用於進度條，避免與常數不一致） */
 function quizSize(rec) {
@@ -1001,7 +1012,10 @@ const state = {
   feedbackHandler: null,
   searching: false,   // 是否正在連網查詢（避免重複送出）
   searchSeq: 0,       // 查詢序號（避免舊查詢覆蓋新結果）
-  quizLoading: false  // 是否正在連網生成每日題目
+  quizLoading: false, // 是否正在連網生成每日題目
+  lastPhraseIdx: 0,   // 最近一次詞組／習語結果的編號（用於背景升級時避免覆蓋新查詢）
+  lastEntry: null,    // 最近一次渲染的單字結果（供「查看原文」等功能重用）
+  quizSessionNo: 0    // 今天正在進行的訓練輪次（1 起算）
 };
 
 function switchTab(tab) {
@@ -1430,10 +1444,18 @@ function analyzeStructure(rawWord, etymologyEn) {
     : { label: '（無後綴）', meaning: '查無常見後綴',
         logic: '系統比對全部常見後綴後，沒有找到可安全切分的字尾。' };
 
+  /* ★ 模組三「舉一反三」：挑一個最值得延伸的詞綴，讓使用者看同詞綴的其他單字 */
+  const relatedAffix = prefixRule
+    ? { value: prefixRule.word, mode: 'prefix', label: prefixRule.word + '- 開頭的字' }
+    : (suffixRule
+        ? { value: suffixRule.word, mode: 'suffix', label: '-' + suffixRule.word + ' 結尾的字' }
+        : null);
+
   return {
     prefix: prefixRule ? (prefixRule.word + '-（' + prefixRule.meaning + '）') : '無明顯前綴',
     root:   rootText + '（核心詞根）',
     suffix: suffixRule ? ('-' + suffixRule.word + '（' + suffixRule.meaning + '）') : '無明顯後綴',
+    relatedAffix: relatedAffix,
     detail: { prefix: pDetail, root: rDetail, suffix: sDetail }
   };
 }
@@ -1513,8 +1535,10 @@ async function lookupWord(word, onProgress) {
   const results = await Promise.allSettled([fetchWiktionary(w), fetchDatamuse(w)]);
   const wiki = (results[0].status === 'fulfilled') ? results[0].value : null;
   const dm   = (results[1].status === 'fulfilled') ? results[1].value : null;
-  if (results[0].status === 'rejected') console.warn('[Wiktionary] 查詢失敗：' + results[0].reason.message);
-  if (results[1].status === 'rejected') console.warn('[Datamuse] 查詢失敗：' + results[1].reason.message);
+  const wikiFailed = (results[0].status === 'rejected');
+  const dmFailed   = (results[1].status === 'rejected');
+  if (wikiFailed) console.warn('[Wiktionary] 查詢失敗：' + (results[0].reason && results[0].reason.message));
+  if (dmFailed)   console.warn('[Datamuse] 查詢失敗：' + (results[1].reason && results[1].reason.message));
 
   const wikiOk = !!(wiki && (wiki.etymologyRaw || (wiki.defs && wiki.defs.length) || wiki.ipa || wiki.posZh));
   report('wiktionary', wikiOk);
@@ -1523,6 +1547,11 @@ async function lookupWord(word, onProgress) {
   if (!wiki && !dm) {
     const fb = lookupWordOffline(w);
     fb.usedFallback = true;
+    /* ★ 關鍵：分辨「這個字根本不存在（拼錯）」與「網路斷線」——
+       - 兩個來源都「連線失敗」 → 判定為網路問題（networkDown），不啟動拼字修正，免得亂猜。
+       - 兩個來源都「有回應但查無此字」 → 判定為拼錯字（notFound），交給【拼寫自動修正模組】接手。 */
+    fb.networkDown = !!(wikiFailed && dmFailed);
+    fb.notFound = !fb.networkDown;
     report('translate', false);
     return fb;
   }
@@ -1604,35 +1633,49 @@ async function prefetchPool(limit) {
 /* ---------------------------------------------------------------------------
    6-11. 查詢畫面的三種狀態：載入中／錯誤／狀態列
    --------------------------------------------------------------------------- */
-function sourceLine(key, label) {
-  return '<div class="src-line"><span class="src-dot loading" data-src-status="' + key + '">⏳</span><span>' + esc(label) + '</span></div>';
+function sourceLine(key, label, idle) {
+  const dot = idle
+    ? '<span class="src-dot" data-src-status="' + key + '" style="opacity:.3">•</span>'
+    : '<span class="src-dot loading" data-src-status="' + key + '">⏳</span>';
+  return '<div class="src-line">' + dot + '<span>' + esc(label) + '</span></div>';
 }
 function updateLoadingSource(source, ok) {
   const el = document.querySelector('[data-src-status="' + source + '"]');
   if (!el) return;
+  el.style.opacity = '';
   if (ok === 'loading') { el.textContent = '⏳'; el.className = 'src-dot loading'; return; }
   el.textContent = ok ? '✅' : '⚠️';
   el.className = 'src-dot';
 }
-function renderLexiconLoading(word) {
+function renderLexiconLoading(word, mode) {
   const resultBox = $('#lexicon-result');
   const emptyBox = $('#lexicon-empty');
   if (!resultBox) return;
   if (emptyBox) emptyBox.classList.add('hidden');
+  const isPhrase = (mode === 'phrase');
+  const lines = [
+    sourceLine('wiktionary', isPhrase
+      ? 'Wiktionary 詞典（片語／習語條目與語源）'
+      : 'Wiktionary 開放語料庫（語源、音標、詞性、釋義）'),
+    sourceLine('datamuse', 'Datamuse 語意資料庫（詞性標記與同義詞）'),
+    sourceLine('translate', isPhrase
+      ? '線上翻譯服務（整句繁體中文翻譯）'
+      : '線上翻譯服務（繁體中文釋義與語源中譯）'),
+    isPhrase
+      ? sourceLine('idiom', '習語／慣用語比對（本地成語詞庫）')
+      : sourceLine('spell', '拼寫自動修正（Levenshtein 編輯距離，查不到時才會啟動）', true)
+  ].join('');
   resultBox.innerHTML = '' +
     '<div class="duo-card p-5 sm:p-6 animate-fade">' +
       '<div class="flex items-center gap-3 mb-4">' +
         '<div class="text-3xl animate-bounce">📡</div>' +
         '<div>' +
           '<p class="font-extrabold text-lg">正在連線全球語料庫…</p>' +
-          '<p class="text-sm font-bold text-[#AFAFAF]">查詢單字：<span class="text-[#1CB0F6] font-extrabold">' + esc(word) + '</span></p>' +
+          '<p class="text-sm font-bold text-[#AFAFAF]">' + (isPhrase ? '查詢詞組：' : '查詢單字：') +
+            '<span class="text-[#1CB0F6] font-extrabold">' + esc(word) + '</span></p>' +
         '</div>' +
       '</div>' +
-      '<div class="space-y-2 mb-5">' +
-        sourceLine('wiktionary', 'Wiktionary 開放語料庫（語源、音標、詞性、釋義）') +
-        sourceLine('datamuse', 'Datamuse 語意資料庫（詞性標記與同義詞）') +
-        sourceLine('translate', '線上翻譯服務（繁體中文釋義與語源中譯）') +
-      '</div>' +
+      '<div class="space-y-2 mb-5">' + lines + '</div>' +
       '<div class="space-y-3">' +
         '<div class="skeleton h-6 w-2/3"></div>' +
         '<div class="skeleton h-4 w-full"></div>' +
@@ -1769,7 +1812,33 @@ function renderWordResult(entry) {
       '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-refresh="' + esc(entry.word) + '">🔁 重新連網查詢</button>' +
     '</div>';
 
+  /* ★ 模組一之一：拼寫自動修正的溫馨提示 */
+  const correctionBanner = (function () {
+    const fix = entry.correction;
+    if (!fix || !fix.from || !fix.to) return '';
+    const len = Math.max(fix.from.length, fix.to.length) || 1;
+    const pct = Math.max(0, Math.round((1 - fix.distance / len) * 100));
+    return '<div class="mb-4 p-4 rounded-2xl bg-[#DDF4FF] border-2 border-[#1CB0F6] animate-pop">' +
+      '<p class="font-extrabold text-[#1899D6] mb-1">✨ 為您顯示「' + esc(fix.to) + '」的翻譯</p>' +
+      '<p class="font-bold text-sm text-[#1899D6] leading-relaxed">' +
+        '標準詞庫中找不到「<b>' + esc(fix.from) + '</b>」。系統已自動計算編輯距離（Levenshtein Distance），' +
+        '判斷你想查的應該是「<b>' + esc(fix.to) + '</b>」（相差 ' + fix.distance + ' 個字母，相似度約 ' + pct + '%）。' +
+        '您是不是要搜尋「' + esc(fix.from) + '」？' +
+      '</p>' +
+      '<div class="mt-3 flex flex-wrap gap-2">' +
+        '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-correct-original="' + esc(fix.from) + '">🔍 不用了，我確定要查「' + esc(fix.from) + '」</button>' +
+        ((fix.candidates && fix.candidates.length > 1)
+          ? fix.candidates.slice(1, 5).map(function (c) {
+              return '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-correct-lookup="' + esc(c.word) + '">🔁 也許是「' + esc(c.word) + '」？</button>';
+            }).join('')
+          : '') +
+      '</div>' +
+      (fix.source ? '<p class="mt-2 text-xs font-bold text-[#1899D6]/70">建議來源：' + esc(fix.source) + '</p>' : '') +
+    '</div>';
+  })();
+
   resultBox.innerHTML = '' +
+    correctionBanner +
     mockBanner +
     sourceBar +
     /* ---------- 卡片 A：釋義 ---------- */
@@ -1879,6 +1948,28 @@ function renderWordResult(entry) {
     });
   }
 
+  // 事件綁定：拼寫修正提示上的候選字與「照原樣查」
+  $$('[data-correct-lookup]', resultBox).forEach(btn => {
+    btn.addEventListener('click', () => {
+      const input = $('#word-input');
+      if (input) input.value = btn.dataset.correctLookup;
+      handleSearch();
+    });
+  });
+  const origBtn = $('[data-correct-original]', resultBox);
+  if (origBtn) {
+    origBtn.addEventListener('click', () => {
+      const orig = origBtn.dataset.correctOriginal;
+      cacheDelete('spellfix:' + orig);
+      state.forceOriginal = orig;          // 這一輪不再自動修正
+      const input = $('#word-input');
+      if (input) input.value = orig;
+      showToast('🔍 已忽略拼寫建議，直接查詢你輸入的原文。', 'info', 3000);
+      handleSearch();
+    });
+  }
+
+  state.lastEntry = entry;                 // 供後續功能重用
   resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -1889,57 +1980,37 @@ async function handleSearch() {
   if (!input) return;
   const raw = input.value.trim();
   if (!raw) {
-    showToast('✏️ 請先輸入一個英文單字再查詢喔！', 'warn', 3000);
+    showToast('✏️ 請先輸入英文單字、習語或句子再查詢喔！', 'warn', 3000);
     input.focus();
     return;
   }
-  const normalized = raw.toLowerCase().replace(/[^a-z]/g, '');
-  if (!normalized) {
+
+  /* ★ 模組一之二：先判斷輸入是「單字」還是「詞組／短句」 */
+  const cls = classifyInput(raw);
+  if (cls.kind === 'invalid') {
     showToast('✏️ 只能輸入英文字母 A–Z 喔！', 'error', 3000);
     return;
   }
-  if (normalized.length > 40) {
-    showToast('✏️ 這個字太長了，請確認是否輸入正確。', 'warn', 3000);
+  if (raw.length > PHRASE_MAX_CHARS) {
+    showToast('✏️ 輸入太長了（最多 ' + PHRASE_MAX_CHARS + ' 個字元）。', 'warn', 3000);
     return;
   }
+
   if (state.searching) return;           // 避免重複送出
   state.searching = true;
   const seq = ++state.searchSeq;
   if (btn) { btn.disabled = true; btn.textContent = '查詢中…'; }
 
   try {
-    /* 1) 先看本機快取（30 天內有效）→ 秒開 */
-    const cached = cacheGet(normalized);
-    if (cached) {
-      const entry = Object.assign({}, cached, { __idx: Date.now(), fromCache: true });
-      renderWordResult(entry);
-      logApiGuide(normalized, entry.sources);
-      showToast('⚡ 已從本機快取讀取「' + esc(normalized) + '」，若要最新資料請按「重新連網查詢」。', 'info', 4500);
-      return;
-    }
-
-    /* 2) 即時連網查詢（Wiktionary ＋ Datamuse ＋ 線上翻譯） */
-    renderLexiconLoading(normalized);
-    const entry = await lookupWord(normalized, updateLoadingSource);
-    if (seq !== state.searchSeq) return;   // 已有更新的查詢，丟棄這次結果
-
-    entry.__idx = Date.now();
-    renderWordResult(entry);
-
-    if (!entry.usedFallback) {
-      cacheSet(normalized, entry);
-      if (entry.meaning) zhSet(normalized, entry.meaning);
-      updateCacheStatus();
-    }
-    logApiGuide(normalized, entry.sources || {});
-
-    if (entry.usedFallback) {
-      showToast('⚠️ 線上來源目前無法連線，已改用離線備用語料顯示「' + esc(normalized) + '」。', 'warn', 6000);
+    if (cls.kind === 'phrase') {
+      await searchPhrase(cls, seq);
+    } else {
+      await searchWord(cls.word, seq);
     }
   } catch (err) {
     if (seq !== state.searchSeq) return;
     console.error('查詢失敗：', err);
-    renderLexiconError(normalized, (err && err.message) ? err.message : '未知錯誤');
+    renderLexiconError(cls.norm, (err && err.message) ? err.message : '未知錯誤');
   } finally {
     if (seq === state.searchSeq) {
       state.searching = false;
@@ -1948,29 +2019,1121 @@ async function handleSearch() {
   }
 }
 
+/* ---------------------------------------------------------------------------------
+   詞組／習語查詢（模組一之二）
+   流程：本機快取 → 【習語詞庫比對 → Wiktionary 片語條目 → 整句翻譯】
+   ★ 命中習語時一律以「整體」呈現，不會拆成個別單字。
+   --------------------------------------------------------------------------------- */
+async function searchPhrase(cls, seq) {
+  const norm = cls.norm;
+  const cacheKey = 'phrase:' + norm;
+
+  /* 1) 本機快取（30 天內有效）→ 秒開 */
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    if (seq !== state.searchSeq) return;
+    renderPhraseResult(Object.assign({}, cached, { fromCache: true }), false);
+    pushHistory({ type: cached.kind, key: norm, label: norm });
+    showToast('⚡ 已從本機快取讀取「' + esc(norm) + '」。', 'info', 3500);
+    return;
+  }
+
+  /* 2) 即時連網查詢 */
+  renderLexiconLoading(norm, 'phrase');
+  const entry = await lookupPhrase(norm, cls.text, updateLoadingSource);
+  if (seq !== state.searchSeq) return;
+
+  entry.__idx = Date.now();
+  renderPhraseResult(entry, false);
+
+  /* 只有「真的需要連網」的結果才值得寫進快取（本機習語詞庫命中是零延遲的） */
+  if (entry.kind === 'sentence' || entry.fromWiktionary) {
+    cacheSet(cacheKey, entry);
+    updateCacheStatus();
+  }
+  pushHistory({ type: entry.kind === 'idiom' ? 'idiom' : 'sentence', key: norm, label: norm });
+
+  if (entry.kind === 'idiom') {
+    showToast(entry.fromLocalDb
+      ? '🟣 命中習語詞庫！已用「整體意思」解釋「' + esc(norm) + '」，不會拆成個別單字。'
+      : '🟣 這是一句習語，以下以整體方式解釋它的意思。', 'info', 5000);
+  } else if (!entry.isOnline) {
+    showToast('⚠️ 線上翻譯服務暫時無法連線，請稍後再試一次。', 'warn', 5000);
+  }
+}
+
+/* ---------------------------------------------------------------------------------
+   單字查詢（模組一之一：拼寫自動修正）
+   流程：本機快取 → 線上詞庫 → 查不到時用 Levenshtein 編輯距離猜測並重查
+   --------------------------------------------------------------------------------- */
+async function searchWord(word, seq) {
+  const input = $('#word-input');
+  const rawTyped = input ? input.value.trim().toLowerCase().replace(/[^a-z]/g, '') : word;
+
+  /* 0) 使用者按過「我確定要查原字」→ 這一輪完全不自動修正（包含不跳錯字對照） */
+  const forceOriginal = (state.forceOriginal === word);
+  state.forceOriginal = '';
+
+  /* 0b) 這個錯字以前修正過：直接跳到正確的那一筆（仍會顯示溫馨提示） */
+  const redirect = forceOriginal ? null : cacheGet('spellfix:' + word);
+  const target = (redirect && redirect.word && cacheGet(redirect.word)) ? redirect.word : word;
+
+  /* 1) 本機快取（30 天內有效）→ 秒開 */
+  const cached = cacheGet(target);
+  if (cached) {
+    if (seq !== state.searchSeq) return;
+    const entry = Object.assign({}, cached, { __idx: Date.now(), fromCache: true });
+    if (!forceOriginal && !entry.isOfflineFallback && rawTyped && rawTyped !== entry.word) {
+      const d = levenshtein(rawTyped, entry.word, 2);
+      if (d <= spellTolerance(rawTyped)) {
+        entry.correction = { from: rawTyped, to: entry.word, distance: d, source: '本機快取', candidates: [] };
+      }
+    }
+    renderWordResult(entry);
+    logApiGuide(entry.word, entry.sources);
+    pushHistory({ type: 'word', key: entry.word, label: entry.word });
+    showToast('⚡ 已從本機快取讀取「' + esc(entry.word) + '」，若要最新資料請按「重新連網查詢」。', 'info', 4500);
+    return;
+  }
+
+  /* 2) 即時連網查詢（Wiktionary ＋ Datamuse ＋ 線上翻譯） */
+  renderLexiconLoading(word);
+  let entry = await lookupWord(word, updateLoadingSource);
+  if (seq !== state.searchSeq) return;   // 已有更新的查詢，丟棄這次結果
+
+  /* 3) ★ 模組一：標準詞庫查不到 → 自動修正拼寫 → 直接以正確單字重新查詢 */
+  let correction = null;
+  if (entry.notFound && !forceOriginal) {
+    updateLoadingSource('spell', 'loading');
+    showToast('🔍 詞庫中找不到「' + esc(word) + '」，正在用編輯距離推算你想查的字…', 'info', 4000);
+    const fix = await correctSpelling(word);
+    if (seq !== state.searchSeq) return;
+    if (fix) {
+      const retry = await lookupWord(fix.to, updateLoadingSource);
+      if (seq !== state.searchSeq) return;
+      if (!retry.notFound && !retry.usedFallback && !retry.networkDown) {
+        entry = retry;
+        correction = fix;
+      }
+    }
+    updateLoadingSource('spell', !!correction);
+  } else if (!forceOriginal && rawTyped && rawTyped !== entry.word) {
+    /* 詞庫直接命中了（例如大小寫或細微差異）：也順手給出提示 */
+    const d = levenshtein(rawTyped, entry.word, 2);
+    if (d <= spellTolerance(rawTyped)) {
+      correction = { from: rawTyped, to: entry.word, distance: d, source: '線上詞庫', candidates: [] };
+    }
+  }
+
+  entry.__idx = Date.now();
+  if (correction) {
+    entry.correction = correction;
+    entry.originalInput = word;
+  }
+
+  renderWordResult(entry);
+
+  if (!entry.usedFallback) {
+    /* ★ 快取一律以「正確單字」為鍵，並記住「錯字 → 正確字」的對應，下次秒開 */
+    const clean = Object.assign({}, entry, { correction: null, originalInput: '' });
+    cacheSet(clean.word, clean);
+    if (correction && correction.to) cacheSet('spellfix:' + correction.from, { word: correction.to });
+    if (entry.meaning) zhSet(entry.word, entry.meaning);
+    updateCacheStatus();
+  }
+  logApiGuide(entry.word, entry.sources || {});
+  pushHistory({ type: 'word', key: entry.word, label: entry.word });
+
+  if (entry.usedFallback) {
+    showToast('⚠️ 線上來源目前無法連線，已改用離線備用語料顯示「' + esc(entry.word) + '」。', 'warn', 6000);
+  } else if (entry.notFound && !correction) {
+    showToast('😅 線上詞庫查不到「' + esc(word) + '」，以下為規則拆解結果。', 'warn', 6000);
+  }
+}
+
+/* =================================================================================
+   【模組一之一：拼寫自動修正（Auto-Correction）】
+   觸發條件：使用者輸入的單字，在標準詞庫（Wiktionary／Datamuse）找不到完全匹配時。
+   處理邏輯：容忍 1~2 個字母的打錯、漏打、多打、順序顛倒，
+             以 Levenshtein 編輯距離計算並挑出最可能的正確單字，直接以正確單字查詢，
+             並在畫面上溫馨提示使用者。
+   ================================================================================= */
+
+/**
+ * Levenshtein 編輯距離（動態規劃，含提早放棄門檻以節省算力）
+ * @param {string} a 來源字串
+ * @param {string} b 目標字串
+ * @param {number} [maxDist] 超過此距離就提早回傳 maxDist+1
+ * @returns {number} 兩字串的最少編輯次數
+ */
+function levenshtein(a, b, maxDist) {
+  const s = String(a == null ? '' : a);
+  const t = String(b == null ? '' : b);
+  if (s === t) return 0;
+  if (!s.length) return t.length;
+  if (!t.length) return s.length;
+  const cap = (typeof maxDist === 'number') ? maxDist : Infinity;
+  if (Math.abs(s.length - t.length) > cap) return cap + 1;
+
+  let prev = new Array(t.length + 1);
+  let curr = new Array(t.length + 1);
+  for (let j = 0; j <= t.length; j++) prev[j] = j;
+
+  for (let i = 1; i <= s.length; i++) {
+    curr[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= t.length; j++) {
+      const cost = (s.charAt(i - 1) === t.charAt(j - 1)) ? 0 : 1;
+      const del = prev[j] + 1;
+      const ins = curr[j - 1] + 1;
+      const sub = prev[j - 1] + cost;
+      curr[j] = Math.min(del, ins, sub);
+      if (curr[j] < rowMin) rowMin = curr[j];
+    }
+    if (rowMin > cap) return cap + 1;
+    const tmp = prev; prev = curr; curr = tmp;
+  }
+  return prev[t.length];
+}
+
+/** 依單字長度決定可容忍的錯字數（規格：容許 1~2 個字母的錯誤） */
+function spellTolerance(word) {
+  const n = String(word || '').length;
+  if (n <= 4) return 1;
+  return 2;
+}
+
+/** 本地候選字：題庫池 ＋ 離線備用語料 ＋ 快取裡查過的字（完全離線也能修正） */
+function localWordCandidates() {
+  const set = new Set();
+  QUIZ_WORDS.forEach(function (w) { set.add(w); });
+  if (typeof WORDS !== 'undefined' && Array.isArray(WORDS)) {
+    WORDS.forEach(function (o) { if (o && o.word) set.add(String(o.word).toLowerCase()); });
+  }
+  const cache = cacheLoad();
+  Object.keys(cache).forEach(function (k) {
+    const kk = String(k).replace(/^phrase:/, '');
+    if (/^[a-z]+$/.test(kk)) set.add(kk);
+  });
+  return Array.from(set);
+}
+
+/** Datamuse 拼字建議端點（專門用來猜「你其實想打哪個字」） */
+function datamuseSuggestUrl(q) {
+  return 'https://api.datamuse.com/sug?s=' + encodeURIComponent(q) + '&max=8';
+}
+/** Wiktionary 搜尋建議端點（opensearch，找不到字時會回傳相近的條目標題） */
+function wiktionarySuggestUrl(q) {
+  return 'https://en.wiktionary.org/w/api.php?action=opensearch&search=' +
+    encodeURIComponent(q) + '&limit=8&namespace=0&format=json&origin=*';
+}
+
+/** 向線上服務要拼字建議（兩路並行；任一失敗都不影響結果） */
+async function fetchSpellingSuggestions(word) {
+  const out = [];
+  const results = await Promise.allSettled([
+    fetchJson(datamuseSuggestUrl(word)),
+    fetchJson(wiktionarySuggestUrl(word))
+  ]);
+  if (results[0].status === 'fulfilled' && Array.isArray(results[0].value)) {
+    results[0].value.forEach(function (item) {
+      if (item && item.word) out.push({ word: String(item.word).toLowerCase(), source: 'Datamuse', score: item.score || 0 });
+    });
+  }
+  if (results[1].status === 'fulfilled' && Array.isArray(results[1].value) && Array.isArray(results[1].value[1])) {
+    results[1].value[1].forEach(function (title) {
+      if (title) out.push({ word: String(title).toLowerCase(), source: 'Wiktionary', score: 0 });
+    });
+  }
+  return out;
+}
+
+/**
+ * 核心：找出最有可能的正確單字
+ * @param {string} word 使用者打錯的字
+ * @returns {Promise<null|{from,to,distance,source,tolerance,candidates}>}
+ */
+async function correctSpelling(word) {
+  const from = String(word == null ? '' : word).trim().toLowerCase().replace(/[^a-z]/g, '');
+  if (from.length < 3) return null;
+  const tol = spellTolerance(from);
+  const judged = [];
+  const seen = new Set();
+
+  function judge(candidate, source, score) {
+    const cand = String(candidate == null ? '' : candidate).trim().toLowerCase();
+    if (!cand || cand === from || !/^[a-z]+$/.test(cand)) return;
+    if (Math.abs(cand.length - from.length) > tol) return;
+    const d = levenshtein(from, cand, tol);
+    if (d > tol) return;
+    const key = cand + '|' + source;
+    if (seen.has(key)) return;
+    seen.add(key);
+    judged.push({ word: cand, distance: d, source: source || '本地字庫', score: score || 0 });
+  }
+
+  localWordCandidates().forEach(function (w) { judge(w, '本地字庫', 0); });
+  try {
+    const remote = await fetchSpellingSuggestions(from);
+    remote.forEach(function (r) { judge(r.word, r.source, r.score); });
+  } catch (err) { /* 離線時僅使用本地候選字，仍可運作 */ }
+
+  if (!judged.length) return null;
+
+  judged.sort(function (a, b) {
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    if (b.score !== a.score) return b.score - a.score;
+    return Math.abs(a.word.length - from.length) - Math.abs(b.word.length - from.length);
+  });
+
+  const unique = [];
+  const picked = new Set();
+  judged.forEach(function (x) { if (!picked.has(x.word)) { picked.add(x.word); unique.push(x); } });
+
+  const best = unique[0];
+  const tied = unique.filter(function (x) { return x.distance === best.distance && x.word !== best.word; }).length;
+  return {
+    from: from, to: best.word, distance: best.distance, source: best.source,
+    tolerance: tol, tied: tied, candidates: unique.slice(0, 6)
+  };
+}
+
+/* =================================================================================
+   【模組一之二：習語／成語感應（Idiom Detection）】
+   觸發條件：輸入包含多於一個單字（詞組或短句）。
+   處理邏輯：先把「完整輸入」拿去和習語詞庫比對；命中就視為一個整體、只解釋整體意思，
+             ★ 絕對不會拆成 bite / the / bullet 個別解釋 ★。
+             沒命中才退回一般短句翻譯。
+   ================================================================================= */
+
+const IDIOMS = [
+  { phrase: 'bite the bullet', meaning: '咬緊牙關、硬著頭皮去做（明知痛苦也得撐過去）', literal: '咬住子彈',
+    example: 'I hate going to the dentist, but I will just bite the bullet.', exampleZh: '我討厭看牙醫，但我還是會硬著頭皮去。',
+    origin: '源自早期外科手術的傳說：那時沒有麻醉藥，士兵動手術時會咬住一顆鉛彈忍痛，「咬子彈」就成了「忍痛撐過去」的代名詞。', tag: '忍耐・下定決心' },
+  { phrase: 'break the ice', meaning: '打破僵局、讓氣氛熱絡起來（通常是雙方剛見面時）', literal: '把冰敲破',
+    example: 'He told a joke to break the ice at the meeting.', exampleZh: '他講了個笑話來打破會議上的僵局。',
+    origin: '早期船隻被冰封時，需要靠人力破冰才能繼續航行；「破冰」後來引申為「化解人際間冰冷陌生的氣氛」。', tag: '社交・破冰' },
+  { phrase: 'piece of cake', meaning: '輕而易舉、小事一樁', literal: '一塊蛋糕',
+    example: 'The test was a piece of cake.', exampleZh: '這次考試簡直是小菜一碟。',
+    origin: '有一說是十九世紀美國南方流行「分食蛋糕」的比賽，贏得蛋糕很輕鬆；另一說是蛋糕材料簡單好做，因此引申為「簡單的事」。', tag: '簡單・輕鬆' },
+  { phrase: 'hit the sack', meaning: '上床睡覺、去睡了', literal: '打那個麻布袋',
+    example: 'I am exhausted, I am going to hit the sack.', exampleZh: '我累壞了，要去睡了。',
+    origin: '早期床墊是用麻布袋裝稻草做的，睡覺就是「往那個袋子上一躺」，因此 hit the sack 等於躺下睡覺。', tag: '日常・睡覺' },
+  { phrase: 'under the weather', meaning: '身體不太舒服、有點生病', literal: '在天氣之下',
+    example: 'She is feeling a bit under the weather today.', exampleZh: '她今天身體有點不舒服。',
+    origin: '源自航海：船員暈船或生病時會被安置到船艙下層避風雨，也就是「在壞天氣之下」，後來泛指身體不適。', tag: '健康・不適' },
+  { phrase: 'spill the beans', meaning: '洩漏秘密、說溜嘴', literal: '把豆子灑出來',
+    example: 'Do not spill the beans about the surprise party!', exampleZh: '別把驚喜派對的事說溜嘴！',
+    origin: '古希臘投票用黑白豆子，不小心打翻罐子就會提前暴露結果；也有說是市場上打翻豆子收拾不完的窘境。總之「灑豆子」＝秘密藏不住。', tag: '秘密・洩漏' },
+  { phrase: 'once in a blue moon', meaning: '千載難逢、極少發生', literal: '藍月亮出現時的那一次',
+    example: 'He only calls me once in a blue moon.', exampleZh: '他極少打電話給我。',
+    origin: '天文上「藍月」是指同一個月出現第二次滿月，大約每兩三年才一次，因此引申為「非常罕見」。', tag: '頻率・罕見' },
+  { phrase: 'cost an arm and a leg', meaning: '貴得要命、價格高得離譜', literal: '要價一隻手臂加一條腿',
+    example: 'That designer bag costs an arm and a leg.', exampleZh: '那個名牌包貴得要命。',
+    origin: '戰爭年代失去手腳是最沉重的代價，用「手臂加腿」來形容付出的代價極高，後來專指價格昂貴。', tag: '金錢・昂貴' },
+  { phrase: 'let the cat out of the bag', meaning: '不小心把秘密說出來、露餡了', literal: '把貓從袋子裡放出來',
+    example: 'Who let the cat out of the bag about the merger?', exampleZh: '是誰把合併的消息洩漏出去的？',
+    origin: '中世紀市集有人用袋子裝豬賣，騙子會偷偷換成貓；買家一打開袋子，貓跳出來，騙局當場曝光。', tag: '秘密・露餡' },
+  { phrase: 'kill two birds with one stone', meaning: '一石二鳥、一次解決兩件事', literal: '一顆石頭打死兩隻鳥',
+    example: 'By cycling to work I kill two birds with one stone: exercise and save money.', exampleZh: '騎車上班讓我一石二鳥：既能運動又省錢。',
+    origin: '最早見於古希臘與拉丁文獻，用「一顆石頭打中兩隻鳥」比喻一次行動得到兩個好處。', tag: '效率・一舉兩得' },
+  { phrase: 'the ball is in your court', meaning: '接下來換你決定了、主動權在你手上', literal: '球在你那一邊的球場',
+    example: 'I have made my offer, so the ball is in your court now.', exampleZh: '我已經提出條件了，接下來換你決定了。',
+    origin: '來自網球等球類運動：球落在誰的場地，就輪到誰行動。用在談判上表示「該你回應了」。', tag: '談判・主導權' },
+  { phrase: 'burn the midnight oil', meaning: '熬夜苦讀、開夜車工作', literal: '燒午夜的油',
+    example: 'She burned the midnight oil to finish her thesis.', exampleZh: '她熬夜苦讀才把論文寫完。',
+    origin: '在電燈發明前，熬夜讀書辦事必須點油燈，燃燒的油就是「熬夜」的具體代價。', tag: '努力・熬夜' },
+  { phrase: 'pull someone\'s leg', meaning: '跟某人開玩笑、逗弄（不是真的欺騙）', literal: '拉某人的腿',
+    example: 'Relax, I am just pulling your leg!', exampleZh: '放輕鬆，我只是在跟你開玩笑！',
+    origin: '十九世紀英國俚語，據說源自扒手用繩子絆倒被害人再搶劫；後來語氣變輕，只剩下「逗你玩」的意思。', tag: '幽默・玩笑' },
+  { phrase: 'on the same page', meaning: '達成共識、彼此理解一致', literal: '在同一頁上',
+    example: 'Let us make sure we are all on the same page before the launch.', exampleZh: '發表前我們先確認大家都是同一個共識。',
+    origin: '源自老師要求全班「翻到同一頁」，引申為團隊成員對同一件事有相同理解。', tag: '團隊・共識' },
+  { phrase: 'cut corners', meaning: '偷工減料、走捷徑省事（常帶貶意）', literal: '把角落切掉',
+    example: 'Never cut corners when it comes to safety.', exampleZh: '談到安全，千萬不要偷工減料。',
+    origin: '源自製造業：為了省成本把轉角的工序省略，成品看起來差不多但品質變差。', tag: '做事・馬虎' },
+  { phrase: 'hit the nail on the head', meaning: '一語中的、正中要害', literal: '一槌敲在釘頭上',
+    example: 'You hit the nail on the head with that analysis.', exampleZh: '你那個分析真是一針見血。',
+    origin: '木工敲釘子時，敲中釘頭才能一次到位；敲偏就失敗，因此比喻「說到關鍵處」。', tag: '說話・精準' },
+  { phrase: 'beat around the bush', meaning: '拐彎抹角、不講重點', literal: '在灌木叢邊拍打',
+    example: 'Stop beating around the bush and tell me the truth.', exampleZh: '別再拐彎抹角了，直接告訴我真相。',
+    origin: '中世紀打獵時，僕役會先拍打灌木叢把獵物趕出來，但真正動手的是別人；引申為「只在外圍繞、不直接處理」。', tag: '說話・迂迴' },
+  { phrase: 'call it a day', meaning: '今天到此為止、收工了', literal: '就稱它為一天吧',
+    example: 'We have done enough, let us call it a day.', exampleZh: '做得夠多了，今天收工吧。',
+    origin: '早期工人以「一天」為計酬單位，老闆說 call it a day 就是宣布今天的工作結束、可以結算工錢了。', tag: '工作・收工' },
+  { phrase: 'get out of hand', meaning: '失控、場面壓不住了', literal: '從手裡跑掉',
+    example: 'The party got out of hand after midnight.', exampleZh: '派對過了午夜就失控了。',
+    origin: '源自騎馬：韁繩沒抓牢，馬就跑掉了。凡是「脫離掌控」的情況都能用。', tag: '情況・失控' },
+  { phrase: 'in hot water', meaning: '惹上麻煩、陷入困境', literal: '在熱水裡',
+    example: 'He is in hot water with his boss again.', exampleZh: '他又惹老闆不高興、陷入麻煩了。',
+    origin: '古時用滾水煮東西或懲罰犯人，掉進熱水裡當然是災難，於是引申為「處境岌岌可危」。', tag: '麻煩・困境' },
+  { phrase: 'jump on the bandwagon', meaning: '跟風、看到有利就跟著一窩蜂投入', literal: '跳上樂隊的花車',
+    example: 'Many brands jumped on the bandwagon after the trend went viral.', exampleZh: '這股風潮爆紅後，很多品牌都跟著一窩蜂投入。',
+    origin: '十九世紀美國競選活動會用載著樂隊的花車遊街，政客搶著跳上車沾人氣，「上花車」就成了「跟風」。', tag: '潮流・跟風' },
+  { phrase: 'no pain, no gain', meaning: '不勞則無獲、吃得苦中苦方為人上人', literal: '沒有痛苦就沒有收穫',
+    example: 'My muscles hurt, but no pain, no gain!', exampleZh: '我的肌肉好痠，但不吃苦怎麼會有成果！',
+    origin: '原是健身與運動界的口號，強調訓練必須付出痠痛代價，後來泛指一切努力與收穫的關係。', tag: '勵志・努力' },
+  { phrase: 'raining cats and dogs', meaning: '傾盆大雨、雨下得非常大', literal: '下貓下狗',
+    example: 'It is raining cats and dogs, take an umbrella!', exampleZh: '外面正下著傾盆大雨，帶把傘吧！',
+    origin: '十七世紀英國城市排水極差，大雨後街上常見到淹死的貓狗屍體被沖來沖去，讓人有「從天上下來」的錯覺。', tag: '天氣・大雨' },
+  { phrase: 'see eye to eye', meaning: '看法一致、意見相同', literal: '眼睛對眼睛',
+    example: 'We do not always see eye to eye, but we respect each other.', exampleZh: '我們不總是意見相同，但彼此尊重。',
+    origin: '出自《聖經・以賽亞書》「以眼還眼」的同一句型，視線齊平象徵立場相同，後來專指意見一致。', tag: '意見・共識' },
+  { phrase: 'sit on the fence', meaning: '保持中立、兩邊都不表態（有時指投機）', literal: '坐在籬笆上',
+    example: 'You cannot sit on the fence forever, you have to choose.', exampleZh: '你不能永遠保持中立，總得選一邊。',
+    origin: '籬笆是兩個院子的分界，坐在上面代表「不屬於任何一邊」，因此引申為觀望不表態。', tag: '立場・中立' },
+  { phrase: 'the last straw', meaning: '壓垮駱駝的最後一根稻草、忍無可忍的臨界點', literal: '最後一根稻草',
+    example: 'The broken printer was the last straw, I quit that job.', exampleZh: '印表機壞掉成了最後一根稻草，我辭了那份工作。',
+    origin: '源自阿拉伯諺語：駱駝背上的稻草一根根加上去，最後一根就讓牠倒下。「the last straw」常省略後面的 that broke the camel\'s back。', tag: '忍耐・臨界點' },
+  { phrase: 'turn a blind eye', meaning: '視而不見、故意裝作沒看到', literal: '把瞎眼轉過去',
+    example: 'The manager turned a blind eye to the constant lateness.', exampleZh: '經理對不斷遲到的情況睜一隻眼閉一隻眼。',
+    origin: '傳說英國海軍名將納爾遜在戰役中無視撤退信號，把望遠鏡湊到瞎掉的那隻眼上說「我真的看不到」。', tag: '態度・忽視' },
+  { phrase: 'a blessing in disguise', meaning: '因禍得福、表面是壞事其實是好事', literal: '偽裝起來的祝福',
+    example: 'Losing that job was a blessing in disguise.', exampleZh: '丟掉那份工作其實是因禍得福。',
+    origin: '十八世紀英語用法，「偽裝的祝福」指一件當下看起來倒楣、事後才發現是好事的事。', tag: '際遇・福禍' },
+  { phrase: 'actions speak louder than words', meaning: '坐而言不如起而行、行動勝於空談', literal: '行動比言語更大聲',
+    example: 'Do not just promise, actions speak louder than words.', exampleZh: '不要只是承諾，坐而言不如起而行。',
+    origin: '這句格言在十六世紀就出現於英語文獻，強調實際作為比口頭保證更可信。', tag: '勵志・言行' },
+  { phrase: 'better late than never', meaning: '遲到總比不到好、亡羊補牢猶未晚矣', literal: '遲來總比永不來好',
+    example: 'You finally started learning! Better late than never.', exampleZh: '你終於開始學了！遲到總比不到好。',
+    origin: '最早可追溯至古希臘與拉丁文，李維與第歐根尼都用過類似句子，是流傳最久的英語格言之一。', tag: '勵志・及時' },
+  { phrase: 'every cloud has a silver lining', meaning: '黑暗中總有一線光明、壞事裡也有好的一面', literal: '每朵雲都有銀色的邊',
+    example: 'Cheer up, every cloud has a silver lining.', exampleZh: '振作一點，每件事都有好的一面。',
+    origin: '源自詩人米爾頓的比喻：厚雲遮住太陽時，雲的邊緣會被陽光照得發亮，象徵困境背後仍藏著希望。', tag: '勵志・希望' },
+  { phrase: 'give someone the benefit of the doubt', meaning: '在證據不足時選擇相信對方、先不懷疑', literal: '把「存疑的好處」給對方',
+    example: 'Since it is his first mistake, I will give him the benefit of the doubt.', exampleZh: '看在他是初犯，這次我就先相信他。',
+    origin: '法律用語：當罪證不足以定罪時，陪審團應「給予疑點的好處」判無罪，生活中引申為「先相信對方」。', tag: '信任・寬容' },
+  { phrase: 'go the extra mile', meaning: '多付出一點、做到超乎要求', literal: '多走那一英里',
+    example: 'She always goes the extra mile for her customers.', exampleZh: '她總是為客戶多做一些。',
+    origin: '出自《聖經・馬太福音》：有人強逼你走一里路，你就同他走二里。後來指「做得比被要求的更多」。', tag: '努力・敬業' },
+  { phrase: 'it\'s not rocket science', meaning: '這不難、沒那麼複雜', literal: '這又不是火箭科學',
+    example: 'Come on, it is not rocket science, just follow the steps.', exampleZh: '拜託，這又不難，照著步驟做就好了。',
+    origin: '冷戰時期火箭科學被視為最尖端的難題，用「不是火箭科學」來反襯一件事其實很簡單。', tag: '簡單・輕鬆' },
+  { phrase: 'keep your chin up', meaning: '抬頭挺胸、別灰心', literal: '把下巴抬起來',
+    example: 'Keep your chin up, the next match is yours.', exampleZh: '別灰心，下一場比賽是你的。',
+    origin: '悲傷低落時人會低頭垂下巴，因此「抬起下巴」就成了要人振作的具體動作。', tag: '鼓勵・打氣' },
+  { phrase: 'learn the ropes', meaning: '摸熟門道、學會做某件事的訣竅', literal: '學會那些繩子',
+    example: 'Give the new intern a week to learn the ropes.', exampleZh: '給新來的實習生一週時間熟悉工作。',
+    origin: '源自帆船時代：水手必須搞懂船上每一條繩索的用途，才能正式上工，「懂繩子」等於「上手」。', tag: '學習・上手' },
+  { phrase: 'miss the boat', meaning: '錯失良機、來不及了', literal: '錯過那班船',
+    example: 'Apply now or you will miss the boat.', exampleZh: '現在就申請，否則你會錯失良機。',
+    origin: '在船運為主要交通與貿易方式的年代，沒趕上船就等於錯過整個機會。', tag: '機會・錯過' },
+  { phrase: 'out of the blue', meaning: '突然地、毫無預警地', literal: '從藍天裡掉出來',
+    example: 'He called me out of the blue after ten years.', exampleZh: '十年後他突然打電話給我。',
+    origin: '完整說法是 out of the blue sky，指晴天霹靂般從萬里無雲的天空落下，強調毫無預兆。', tag: '突發・意外' },
+  { phrase: 'play it by ear', meaning: '見機行事、臨時再決定', literal: '靠耳朵演奏',
+    example: 'We have no fixed plan, let us just play it by ear.', exampleZh: '我們沒有固定計畫，就見機行事吧。',
+    origin: '源自音樂：不看譜、憑耳朵聽出來的旋律即興演奏，引申為「不預設計畫、隨機應變」。', tag: '彈性・應變' },
+  { phrase: 'put all your eggs in one basket', meaning: '孤注一擲、把所有希望押在同一個地方', literal: '把所有雞蛋放在同一個籃子',
+    example: 'Do not put all your eggs in one basket when investing.', exampleZh: '投資時不要孤注一擲。',
+    origin: '源自農家常識：雞蛋全放一籃，一摔就全破；因此比喻風險過度集中。', tag: '風險・分散' },
+  { phrase: 'read between the lines', meaning: '讀出言外之意、體會絃外之音', literal: '讀字裡行間',
+    example: 'If you read between the lines, you can tell he is unhappy.', exampleZh: '如果你讀出言外之意，就會發現他並不開心。',
+    origin: '早期書信常用密寫藥水在字裡行間寫秘密訊息，只有懂得「讀中間」的人才能看出真正意思。', tag: '理解・暗示' },
+  { phrase: 'speak of the devil', meaning: '說曹操曹操到（剛提到某人，他就出現了）', literal: '講到魔鬼',
+    example: 'Speak of the devil, here comes Tom now!', exampleZh: '說曹操曹操到，Tom 這不就來了！',
+    origin: '完整句子是 Speak of the devil and he will appear，源自中世紀對魔鬼的忌諱，後來語氣變輕鬆，專門用在「剛提到就出現」。', tag: '日常・巧合' },
+  { phrase: 'the early bird catches the worm', meaning: '早起的鳥兒有蟲吃、捷足先登', literal: '早起的鳥才抓得到蟲',
+    example: 'Book early, the early bird catches the worm.', exampleZh: '早點訂位，早起的鳥兒有蟲吃。',
+    origin: '最早見於十七世紀英國諺語集，用鳥與蟲的關係說明「搶得先機者得利」。', tag: '努力・先機' },
+  { phrase: 'throw in the towel', meaning: '認輸、放棄', literal: '把毛巾丟進去',
+    example: 'After three failed attempts, he threw in the towel.', exampleZh: '失敗三次之後，他選擇放棄。',
+    origin: '源自拳擊：教練把毛巾丟進擂台代表放棄比賽。後來泛指任何「認輸收手」。', tag: '放棄・認輸' },
+  { phrase: 'two heads are better than one', meaning: '三個臭皮匠勝過一個諸葛亮、集思廣益更好', literal: '兩個頭比一個頭好',
+    example: 'Let us work on it together, two heads are better than one.', exampleZh: '我們一起想吧，兩個人總比一個人強。',
+    origin: '最早見於十六世紀英語格言，強調合作與討論能補足個人思考的盲點。', tag: '合作・集思' },
+  { phrase: 'you can\'t judge a book by its cover', meaning: '不能以貌取人、不要只看外表', literal: '不能憑封面評斷一本書',
+    example: 'He looks serious, but he is hilarious, you cannot judge a book by its cover.', exampleZh: '他看起來很嚴肅，其實超好笑，不能以貌取人。',
+    origin: '十九世紀中葉英語格言，用「書的封面」比喻外表，提醒人事物真正的價值在內容。', tag: '態度・外表' },
+  { phrase: 'break a leg', meaning: '祝你好運（特別是上台表演前）', literal: '摔斷一條腿',
+    example: 'Break a leg at your recital tonight!', exampleZh: '祝你今晚的演奏會順利！',
+    origin: '劇場忌諱直接說 good luck，怕招來厄運，於是故意說反話、用「摔斷腿」當祝福。', tag: '祝福・表演' },
+  { phrase: 'get cold feet', meaning: '臨陣退縮、突然怯場', literal: '腳變冷了',
+    example: 'He got cold feet right before the wedding.', exampleZh: '他在婚禮前夕突然臨陣退縮。',
+    origin: '有一說源自士兵在雪地行軍時腳凍僵、再也走不動；引申為關鍵時刻因害怕而退縮。', tag: '勇氣・怯場' },
+  { phrase: 'on cloud nine', meaning: '樂不可支、開心得飄上天', literal: '在第九層雲上',
+    example: 'She was on cloud nine after getting the offer.', exampleZh: '拿到錄取通知後她樂壞了。',
+    origin: '氣象學曾把雲分成九個層級，第九層是最高的雲；站在最高的雲上，自然形容「開心到極點」。', tag: '情緒・開心' },
+  { phrase: 'the tip of the iceberg', meaning: '冰山一角、顯露出來的只是極小部分', literal: '冰山的尖端',
+    example: 'The reported cases are just the tip of the iceberg.', exampleZh: '被報導出來的案例只是冰山一角。',
+    origin: '冰山約九成體積藏在水面下，只看見尖端會嚴重低估全貌，因此比喻「可見的問題遠小於隱藏的部分」。', tag: '問題・全貌' },
+  { phrase: 'keep an eye on', meaning: '留意、幫忙盯著', literal: '放一隻眼睛在上面',
+    example: 'Please keep an eye on my luggage while I buy tickets.', exampleZh: '我去買票時請幫我盯著行李。',
+    origin: '把注意力具體化成「一隻眼睛」，從中世紀英語就有的說法，強調持續關注而非匆匆一瞥。', tag: '注意・照看' },
+  { phrase: 'make ends meet', meaning: '勉強維持生計、收支打平', literal: '讓兩端相接',
+    example: 'It is hard to make ends meet on one salary.', exampleZh: '只靠一份薪水很難維持生計。',
+    origin: '源自記帳：把收入那端與支出那端接起來（不負債）就算過關，是最貼近生活的財務習語。', tag: '金錢・生計' },
+  { phrase: 'pull yourself together', meaning: '振作起來、控制好自己的情緒', literal: '把自己拼回原狀',
+    example: 'Pull yourself together, we have a game to win.', exampleZh: '振作起來，我們還有比賽要贏。',
+    origin: '把散掉的自己「重新組裝起來」，是十九世紀英語用來要求對方停止失控、恢復鎮定的說法。', tag: '鼓勵・鎮定' },
+  { phrase: 'take it easy', meaning: '放輕鬆、別緊張／保重', literal: '把事情看得輕鬆一點',
+    example: 'Take it easy, everything will be fine.', exampleZh: '放輕鬆，一切都會沒事的。',
+    origin: '十九世紀美國口語，原意是「不要過度費力」，後來既是安慰也是道別時的「保重」。', tag: '安慰・放鬆' },
+  { phrase: 'when pigs fly', meaning: '不可能發生、太陽打西邊出來', literal: '當豬會飛的時候',
+    example: 'He will clean his room when pigs fly.', exampleZh: '他會打掃房間？等太陽打西邊出來吧。',
+    origin: '英語用「豬飛上天」形容絕無可能的事，類似的荒謬畫面在蘇格蘭與德語諺語中也有。', tag: '否定・不可能' }
+];
+
+/** 正規化詞組：統一大小寫、統一所有格符號、去除標點與多餘空白 */
+function normalizePhrase(text) {
+  return String(text == null ? '' : text)
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u02bc\u0060]/g, "'")
+    .replace(/[^a-z0-9'\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 產生一個詞組的各種可能寫法（讓使用者不必輸入得一字不差） */
+function phraseVariants(phrase) {
+  const base = normalizePhrase(phrase);
+  const out = new Set();
+  if (!base) return [];
+  out.add(base);
+  out.add(base.replace(/^(to|a|an|the)\s+/, ''));
+  out.add(base + (base.slice(-1) === 's' ? '' : ''));
+  const poss = base.replace(/\bsomeone's\b/g, 'your').replace(/\bone's\b/g, 'your')
+                   .replace(/\bsomeone\b/g, 'you').replace(/\bsomething\b/g, 'it');
+  out.add(poss);
+  out.add(poss.replace(/\byour\b/g, "one's"));
+  Array.from(out).forEach(function (v) { out.add(idiomKeyLoose(v)); });
+  return Array.from(out).filter(Boolean);
+}
+
+/** 寬鬆鍵：拿掉冠詞、介系詞等不影響語意的虛詞 */
+function idiomKeyLoose(text) {
+  return String(text == null ? '' : text)
+    .replace(/\b(the|a|an|to|of)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 建立習語索引（嚴謹版 + 寬鬆版），只建一次 */
+const IDIOM_INDEX = (function () {
+  const exact = new Map();
+  const loose = new Map();
+  IDIOMS.forEach(function (item) {
+    phraseVariants(item.phrase).forEach(function (v) {
+      if (!exact.has(v)) exact.set(v, item);
+      const lk = idiomKeyLoose(v);
+      if (lk && !loose.has(lk)) loose.set(lk, item);
+    });
+  });
+  return { exact: exact, loose: loose };
+})();
+
+/** 比對習語詞庫（先嚴格比對，再放寬虛詞） */
+function findIdiom(text) {
+  const variants = phraseVariants(text);
+  for (let i = 0; i < variants.length; i++) {
+    const hit = IDIOM_INDEX.exact.get(variants[i]);
+    if (hit) return hit;
+  }
+  for (let j = 0; j < variants.length; j++) {
+    const lk = idiomKeyLoose(variants[j]);
+    const hit = IDIOM_INDEX.loose.get(lk);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** 判斷輸入是「單字」還是「詞組／短句」 */
+function classifyInput(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  const norm = normalizePhrase(text);
+  const rawLetters = text.replace(/[^A-Za-z]/g, '');
+  if (!norm || !rawLetters) return { kind: 'invalid' };
+  const wordCount = norm.split(/\s+/).filter(Boolean).length;
+  if (wordCount === 1 && /^[a-z]+$/.test(norm)) {
+    return { kind: 'word', text: text, norm: norm, word: norm, wordCount: 1 };
+  }
+  return { kind: 'phrase', text: text, norm: norm, wordCount: wordCount };
+}
+
+/** 從本地習語詞庫組出一筆結果 */
+function buildIdiomEntry(item, norm) {
+  return {
+    kind: 'idiom',
+    phrase: norm,
+    label: norm,
+    meaning: item.meaning,
+    literal: item.literal || '',
+    example: item.example || '',
+    exampleZh: item.exampleZh || '',
+    origin: item.origin || '',
+    originZh: '',
+    tag: item.tag || '',
+    defs: [],
+    ipa: '',
+    source: '本地習語詞庫',
+    fromLocalDb: true,
+    fromWiktionary: false,
+    needsEnrich: true,
+    isOnline: false,
+    sources: { idiom: true, wiktionary: false, translate: true }
+  };
+}
+
+/**
+ * 詞組／短句查詢：① 習語詞庫 → ② Wiktionary 片語條目 → ③ 整句翻譯
+ * ★ 命中習語時一律視為整體，回傳 kind:'idiom'，絕不拆成個別單字。
+ */
+async function lookupPhrase(norm, rawText, onProgress) {
+  const report = (typeof onProgress === 'function') ? onProgress : function () {};
+
+  report('idiom', 'loading');
+  const local = findIdiom(norm);
+  if (local) {
+    report('idiom', true);
+    report('wiktionary', false);
+    report('translate', false);
+    return buildIdiomEntry(local, norm);
+  }
+  report('idiom', false);
+
+  report('wiktionary', 'loading');
+  let wiki = null;
+  try { wiki = await fetchWiktionary(norm); } catch (err) { wiki = null; }
+  const wikiOk = !!(wiki && (wiki.etymologyRaw || (wiki.defs && wiki.defs.length)));
+  report('wiktionary', wikiOk);
+
+  report('translate', 'loading');
+  let translation = '';
+  try { translation = await translateZh(norm); } catch (err) { translation = ''; }
+  report('translate', !!translation);
+
+  if (wikiOk) {
+    let originZh = '';
+    if (wiki.etymologyRaw) {
+      try { originZh = await translateZh(wiki.etymologyRaw); } catch (err) { originZh = ''; }
+    }
+    return {
+      kind: 'idiom',
+      phrase: norm,
+      label: norm,
+      meaning: translation || '（線上翻譯服務暫時無法取得中文翻譯）',
+      literal: '',
+      example: '',
+      exampleZh: '',
+      origin: wiki.etymologyRaw || '',
+      originZh: originZh,
+      originRaw: wiki.etymologyRaw || '',
+      tag: '',
+      defs: (wiki.defs || []).slice(0, 3),
+      ipa: wiki.ipa || '',
+      source: 'Wiktionary 詞典片語條目',
+      fromLocalDb: false,
+      fromWiktionary: true,
+      needsEnrich: false,
+      isOnline: true,
+      sources: { idiom: false, wiktionary: true, translate: !!translation }
+    };
+  }
+
+  return {
+    kind: 'sentence',
+    text: rawText,
+    phrase: norm,
+    label: norm,
+    translation: translation || '（線上翻譯服務暫時無法取得中文翻譯）',
+    isOnline: !!translation,
+    sources: { idiom: false, wiktionary: false, translate: !!translation }
+  };
+}
+
+/** 背景補強：用 Wiktionary 的真實語源替本機習語庫的資料加值 */
+async function enrichIdiom(entry) {
+  try {
+    const wiki = await fetchWiktionary(entry.phrase);
+    if (!wiki) return null;
+    const hasAnything = !!(wiki.etymologyRaw || (wiki.defs && wiki.defs.length) || wiki.ipa);
+    if (!hasAnything) return null;
+    const patch = {
+      defs: (wiki.defs || []).slice(0, 3),
+      ipa: wiki.ipa || '',
+      fromWiktionary: true,
+      source: '本地習語詞庫 ＋ Wiktionary 語源',
+      sources: { idiom: true, wiktionary: true, translate: true }
+    };
+    if (wiki.etymologyRaw) {
+      patch.originRaw = wiki.etymologyRaw;
+      try { patch.originZh = await translateZh(wiki.etymologyRaw); } catch (err) { patch.originZh = ''; }
+    }
+    return patch;
+  } catch (err) { return null; }
+}
+
+/** 短句用不到的功能詞，避免使用者按了也查不到 */
+const PHRASE_STOPWORDS = new Set(['the', 'a', 'an', 'to', 'of', 'in', 'on', 'at', 'and', 'or', 'but',
+  'is', 'are', 'was', 'were', 'be', 'been', 'am', 'do', 'does', 'did', 'it', 'its', 'this', 'that',
+  'i', 'you', 'he', 'she', 'we', 'they', 'my', 'your', 'his', 'her', 'our', 'their', 'me', 'him', 'them', 'us', 'as', 'by', 'for', 'with']);
+
+/* =================================================================================
+   【模組一之三：詞組／習語結果渲染】
+   習語卡片：「一個整體」的解釋，並明示系統沒有拆字。
+   短句卡片：整句翻譯，另外提供「可選的」個別單字查詢入口。
+   ================================================================================= */
+function renderPhraseResult(entry, silent) {
+  const resultBox = $('#lexicon-result');
+  const emptyBox = $('#lexicon-empty');
+  if (!resultBox) return;
+  if (emptyBox) emptyBox.classList.add('hidden');
+  entry.__idx = entry.__idx || Date.now();
+  state.lastPhraseIdx = entry.__idx;
+
+  const isIdiom = (entry.kind === 'idiom');
+  const badges = (function () {
+    let html = isIdiom
+      ? '<span class="stat-chip">🟣 習語／慣用語</span>'
+      : '<span class="stat-chip">💬 整句翻譯</span>';
+    html += '<span class="stat-chip">📚 ' + esc(entry.source || '線上查詢') + '</span>';
+    if (entry.fromWiktionary) html += '<span class="stat-chip">📖 Wiktionary 片語條目</span>';
+    if (entry.originZh) html += '<span class="stat-chip">🈶 語源中譯</span>';
+    html += '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-phrase-refresh="' + esc(entry.phrase) + '">🔁 重新連網查詢</button>';
+    return html;
+  })();
+
+  const notice = isIdiom
+    ? '<div class="mb-4 p-4 rounded-2xl bg-[#F3E8FF] border-2 border-[#CE82FF] font-extrabold text-sm text-[#8B44C9] leading-relaxed">' +
+        '✅ 這是一句固定習語，系統已把「<b>' + esc(entry.phrase) + '</b>」當成<b>一個整體</b>來解釋，' +
+        '<b>不會</b>拆成各別單字（例如 bite / the / bullet）分別解釋，以免干擾你的理解。' +
+      '</div>'
+    : '<div class="mb-4 p-4 rounded-2xl bg-[#DDF4FF] border-2 border-[#84D8FF] font-extrabold text-sm text-[#1899D6] leading-relaxed">' +
+        '💬 這不是收錄在習語詞庫裡的固定習語，因此系統走「一般短句翻譯」流程，整句翻譯如下。' +
+      '</div>';
+
+  const speakBtn = '<button class="duo-btn duo-btn-blue duo-btn-sm" data-phrase-speak="' + esc(entry.phrase) + '">🔊 聽整句發音</button>';
+
+  /* 讓使用者「自己選擇」是否要看個別單字（非自動，因此不違反「習語不得拆解」的精神） */
+  const chips = (function () {
+    const src = isIdiom ? entry.phrase : entry.text;
+    const words = String(src || '').toLowerCase().replace(/[^a-z\s'-]/g, ' ').split(/\s+/)
+      .map(function (w) { return w.replace(/^['-]+|['-]+$/g, ''); })
+      .filter(function (w) { return w.length >= 3 && !PHRASE_STOPWORDS.has(w); });
+    const uniq = Array.from(new Set(words)).slice(0, 8);
+    if (!uniq.length) return '';
+    return '<details class="mt-1">' +
+      '<summary class="cursor-pointer text-xs font-extrabold text-[#1CB0F6] select-none">🔤 仍想單獨看某個字的深度拆解？（可選，系統不會自動拆解）</summary>' +
+      '<div class="mt-3 flex flex-wrap gap-2">' +
+        uniq.map(function (w) {
+          return '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-word-chip="' + esc(w) + '">📘 ' + esc(w) + '</button>';
+        }).join('') +
+      '</div></details>';
+  })();
+
+  let body = '';
+
+  if (isIdiom) {
+    body = '' +
+      '<div class="duo-card p-5 sm:p-6 animate-pop">' +
+        '<div class="flex items-center gap-2 mb-1 flex-wrap">' +
+          '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-[#F3E8FF] text-[#8B44C9]">卡片 A ・ 習語整體意思</span>' +
+          (entry.tag ? '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-[#FFF3C4] text-[#B58B00]">🏷️ ' + esc(entry.tag) + '</span>' : '') +
+        '</div>' +
+        '<div class="flex flex-wrap items-center gap-3 mt-2">' +
+          '<h3 class="text-2xl sm:text-4xl font-extrabold text-[#CE82FF] break-words">' + esc(entry.phrase) + '</h3>' +
+          speakBtn +
+        '</div>' +
+        (entry.ipa ? '<p class="mt-2 text-sm font-bold text-[#AFAFAF]">' + esc(entry.ipa) + '</p>' : '') +
+        '<div class="divider my-4"></div>' +
+        '<p class="text-sm font-extrabold text-[#AFAFAF] mb-1">繁體中文意思</p>' +
+        '<p class="font-extrabold text-xl sm:text-2xl text-[#4B4B4B] leading-relaxed">' + esc(entry.meaning) + '</p>' +
+        (entry.literal
+          ? '<p class="mt-3 text-sm font-bold text-[#4B4B4B]/80">🪄 字面直譯：' + esc(entry.literal) + '（不是真正的意思，只是幫助記憶的畫面）</p>'
+          : '') +
+        (entry.example
+          ? '<div class="mt-4 p-3 rounded-2xl bg-[#F7F7F7] border-2 border-[#E5E5E5]">' +
+              '<p class="text-xs font-extrabold text-[#AFAFAF] mb-2">✍️ 例句</p>' +
+              '<p class="font-bold text-[15px] leading-relaxed text-[#4B4B4B]">' + esc(entry.example) + '</p>' +
+              (entry.exampleZh ? '<p class="mt-1 text-sm font-bold text-[#AFAFAF]">' + esc(entry.exampleZh) + '</p>' : '') +
+            '</div>'
+          : '') +
+        ((entry.defs && entry.defs.length)
+          ? '<div class="mt-3 p-3 rounded-2xl bg-[#F7F7F7] border-2 border-[#E5E5E5]">' +
+              '<p class="text-xs font-extrabold text-[#AFAFAF] mb-2">📖 線上詞典的英文解釋</p>' +
+              '<ul class="list-disc pl-5 space-y-1">' +
+                entry.defs.map(function (d) { return '<li class="text-sm font-bold leading-relaxed text-[#4B4B4B]/85">' + esc(d) + '</li>'; }).join('') +
+              '</ul>' +
+            '</div>'
+          : '') +
+      '</div>' +
+      '<div class="duo-card p-5 sm:p-6 animate-pop" style="animation-delay:.08s">' +
+        '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-[#FFF3C4] text-[#B58B00]">卡片 B ・ 這句習語的由來</span>' +
+        '<h4 class="text-xl font-extrabold mt-3 mb-3">📜 為什麼會有這種說法？</h4>' +
+        '<div class="p-4 rounded-2xl bg-[#F7F7F7] border-l-4 border-[#CE82FF]">' +
+          '<p class="font-bold leading-relaxed text-[15px] sm:text-base whitespace-pre-line">' +
+            esc(entry.originZh || entry.origin || '這句習語目前沒有收錄來源故事，但它已經是英語母語者天天在用的固定說法。') +
+          '</p>' +
+        '</div>' +
+        (entry.originRaw
+          ? '<details class="mt-3">' +
+              '<summary class="cursor-pointer text-xs font-extrabold text-[#1CB0F6] select-none">🔤 查看英文原文語源（直接取自 Wiktionary，未經翻譯）</summary>' +
+              '<p class="mt-2 p-3 rounded-2xl bg-[#FAFAFA] border-2 border-[#E5E5E5] text-sm font-bold leading-relaxed text-[#4B4B4B]/85 whitespace-pre-line">' + esc(entry.originRaw) + '</p>' +
+            '</details>'
+          : '') +
+        '<div class="mt-4">' + chips + '</div>' +
+      '</div>';
+  } else {
+    body = '' +
+      '<div class="duo-card p-5 sm:p-6 animate-pop">' +
+        '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-[#DDF4FF] text-[#1899D6]">卡片 A ・ 整句翻譯</span>' +
+        '<div class="flex flex-wrap items-center gap-3 mt-3">' +
+          '<h4 class="text-xl font-extrabold">💬 繁體中文翻譯</h4>' +
+          speakBtn +
+        '</div>' +
+        '<p class="mt-3 p-4 rounded-2xl bg-[#F7F7F7] border-l-4 border-[#1CB0F6] font-extrabold text-lg sm:text-xl leading-relaxed text-[#4B4B4B] whitespace-pre-line">' + esc(entry.translation) + '</p>' +
+        '<p class="mt-3 text-sm font-bold text-[#AFAFAF]">原文：' + esc(entry.text || entry.phrase) + '</p>' +
+        '<div class="divider my-4"></div>' +
+        chips +
+      '</div>';
+  }
+
+  resultBox.innerHTML = '' +
+    '<div class="mb-4 flex flex-wrap items-center gap-2">' + badges + '</div>' +
+    notice +
+    body;
+
+  bindPhraseEvents(entry);
+
+  if (!silent) resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  /* 本機習語命中時，背景再向 Wiktionary 要真實語源，拿到後原地升級卡片 */
+  if (entry.needsEnrich) {
+    const myIdx = entry.__idx;
+    enrichIdiom(entry).then(function (patch) {
+      if (!patch) return;
+      if (state.lastPhraseIdx !== myIdx) return;   // 使用者已經查別的東西了
+      const merged = Object.assign({}, entry, patch, { needsEnrich: false, __idx: myIdx });
+      renderPhraseResult(merged, true);
+    });
+  }
+}
+
+/** 詞組卡片的互動綁定 */
+function bindPhraseEvents(entry) {
+  const resultBox = $('#lexicon-result');
+  if (!resultBox) return;
+
+  $$('[data-phrase-speak]', resultBox).forEach(function (btn) {
+    btn.addEventListener('click', function () { speak(btn.dataset.phraseSpeak); });
+  });
+
+  $$('[data-word-chip]', resultBox).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const input = $('#word-input');
+      if (input) input.value = btn.dataset.wordChip;
+      handleSearch();
+    });
+  });
+
+  $$('[data-phrase-refresh]', resultBox).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      cacheDelete('phrase:' + btn.dataset.phraseRefresh);
+      showToast('🔁 已清除快取，重新連線查詢中…', 'info', 3000);
+      handleSearch();
+    });
+  });
+}
+
+/* =================================================================================
+   【模組三：進階拆字與詞綴分析 — 輸入即時感應 ＋ 舉一反三】
+   使用者還在打字時就先做本機詞綴拆解（零延遲、不耗流量）；
+   需要更多真實語料時再按「舉一反三」，即時向 Datamuse 要同詞綴的其他單字。
+   ================================================================================= */
+let liveAnalysisTimer = null;
+
+function scheduleLiveAnalysis() {
+  if (liveAnalysisTimer) clearTimeout(liveAnalysisTimer);
+  liveAnalysisTimer = setTimeout(runLiveAnalysis, LIVE_ANALYSIS_DELAY_MS);
+}
+
+function clearLiveAnalysis() {
+  if (liveAnalysisTimer) { clearTimeout(liveAnalysisTimer); liveAnalysisTimer = null; }
+  const box = $('#live-analysis');
+  if (box) box.innerHTML = '';
+}
+
+function runLiveAnalysis() {
+  const box = $('#live-analysis');
+  if (!box) return;
+  const input = $('#word-input');
+  const raw = input ? input.value.trim() : '';
+  const cls = classifyInput(raw);
+  if (cls.kind === 'invalid') { box.innerHTML = ''; return; }
+
+  if (cls.kind === 'phrase') {
+    const idiom = findIdiom(cls.norm);
+    box.innerHTML = idiom
+      ? '<div class="p-3 rounded-2xl bg-[#F3E8FF] border-2 border-[#CE82FF] flex flex-wrap items-center gap-2 animate-fade">' +
+          '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-white text-[#8B44C9]">🟣 感應到習語</span>' +
+          '<span class="font-extrabold text-sm text-[#8B44C9]">這句是固定習語，查詢時會以「整組意思」解釋，不會拆字。</span>' +
+        '</div>'
+      : '<div class="p-3 rounded-2xl bg-[#DDF4FF] border-2 border-[#84D8FF] flex flex-wrap items-center gap-2 animate-fade">' +
+          '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-white text-[#1899D6]">💬 感應到詞組／句子</span>' +
+          '<span class="font-extrabold text-sm text-[#1899D6]">將以整句翻譯處理。</span>' +
+        '</div>';
+    return;
+  }
+
+  if (cls.word.length < 3) { box.innerHTML = ''; return; }
+
+  const st = analyzeStructure(cls.word, '');
+  const d = st.detail;
+  function chip(label, cls2, data) {
+    const empty = !data || !data.label || data.label.indexOf('無') === 0 || data.label.indexOf('（無') === 0;
+    return '<span class="tag ' + (empty ? 'tag-empty' : cls2) + '" style="cursor:default">' +
+      '<span class="block text-[10px] font-extrabold opacity-70">' + esc(label) + '</span>' +
+      '<span class="block text-sm">' + esc(data ? data.label : '—') + '</span>' +
+    '</span>';
+  }
+  box.innerHTML = '' +
+    '<div class="p-4 rounded-2xl bg-[#FAFAFA] border-2 border-dashed border-[#E5E5E5] animate-fade">' +
+      '<div class="flex flex-wrap items-center gap-2 mb-3">' +
+        '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-[#D7FFB7] text-[#4CA30A]">🧩 即時拆字感應（本機，零延遲）</span>' +
+        '<span class="text-xs font-bold text-[#AFAFAF]">打字時就開始拆，按「查詢」可取得真實語源</span>' +
+      '</div>' +
+      '<div class="flex flex-wrap items-center gap-2 mb-3">' +
+        chip('前綴 Prefix', 'tag-prefix', d.prefix) +
+        '<span class="text-xl font-extrabold text-[#AFAFAF]">+</span>' +
+        chip('詞根 Root', 'tag-root', d.root) +
+        '<span class="text-xl font-extrabold text-[#AFAFAF]">+</span>' +
+        chip('後綴 Suffix', 'tag-suffix', d.suffix) +
+      '</div>' +
+      '<ul class="space-y-1 text-sm font-bold text-[#4B4B4B]/85">' +
+        '<li>🔵 前綴：' + esc(d.prefix.meaning) + '</li>' +
+        '<li>🟢 詞根：' + esc(d.root.meaning) + '</li>' +
+        '<li>🟡 後綴：' + esc(d.suffix.meaning) + '</li>' +
+      '</ul>' +
+      '<div class="mt-3 flex flex-wrap gap-2">' +
+        (st.relatedAffix
+          ? '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-related="' + esc(st.relatedAffix.value) + '" data-related-mode="' + esc(st.relatedAffix.mode) + '">🔍 舉一反三：更多 ' + esc(st.relatedAffix.label) + '</button>'
+          : '') +
+        '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-live-search="' + esc(cls.word) + '">🔎 連網查「' + esc(cls.word) + '」的完整資料</button>' +
+      '</div>' +
+      '<div id="related-words" class="mt-3"></div>' +
+    '</div>';
+
+  $$('[data-live-search]', box).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const input2 = $('#word-input');
+      if (input2) input2.value = btn.dataset.liveSearch;
+      handleSearch();
+    });
+  });
+
+  $$('[data-related]', box).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      loadRelatedWords(btn.dataset.related, btn.dataset.relatedMode, btn);
+    });
+  });
+}
+
+/** 舉一反三：向 Datamuse 要「同樣詞綴」的其他單字（wildcard 查詢） */
+async function fetchRelatedByAffix(affix, mode) {
+  const pattern = (mode === 'prefix') ? (affix + '*') : ('*' + affix);
+  const url = 'https://api.datamuse.com/words?sp=' + encodeURIComponent(pattern) + '&max=16';
+  const json = await fetchJson(url);
+  if (!Array.isArray(json)) return [];
+  return json.map(function (x) { return String(x.word || '').toLowerCase(); })
+    .filter(function (w) { return /^[a-z]+$/.test(w); })
+    .slice(0, 14);
+}
+
+/** 載入並顯示「舉一反三」的相關單字 */
+async function loadRelatedWords(affix, mode, btn) {
+  const box = $('#related-words');
+  if (!box) return;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 連網查詢中…'; }
+  box.innerHTML = '<div class="space-y-2"><div class="skeleton h-4 w-1/3"></div><div class="skeleton h-4 w-1/2"></div></div>';
+  try {
+    const words = await fetchRelatedByAffix(affix, mode);
+    if (!words.length) {
+      box.innerHTML = '<p class="text-sm font-bold text-[#AFAFAF]">目前查不到同樣詞綴的其他單字。</p>';
+      return;
+    }
+    box.innerHTML = '<p class="text-xs font-extrabold text-[#AFAFAF] mb-2">🧠 同一個詞綴還能這樣用（點一下直接查）：</p>' +
+      '<div class="flex flex-wrap gap-2">' +
+        words.map(function (w) {
+          return '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-word-chip="' + esc(w) + '">' + esc(w) + '</button>';
+        }).join('') +
+      '</div>';
+    $$('[data-word-chip]', box).forEach(function (b) {
+      b.addEventListener('click', function () {
+        const input = $('#word-input');
+        if (input) input.value = b.dataset.wordChip;
+        handleSearch();
+      });
+    });
+  } catch (err) {
+    box.innerHTML = '<p class="text-sm font-bold text-[#EA2B2B]">連網失敗，請確認網路連線後再試。</p>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔍 舉一反三：更多 ' + affix + (mode === 'prefix' ? '-' : ''); }
+  }
+}
+
+/* =================================================================================
+   【最近查詢紀錄】保留使用者查過的字，並提供一鍵重查
+   ================================================================================= */
+function getHistory() {
+  const list = lsGet(LS_KEYS.HISTORY, []);
+  return Array.isArray(list) ? list : [];
+}
+
+function pushHistory(item) {
+  if (!item || !item.key) return;
+  const list = getHistory().filter(function (x) { return !(x.key === item.key && x.type === item.type); });
+  list.unshift({ type: item.type, key: item.key, label: item.label || item.key, at: Date.now() });
+  lsSet(LS_KEYS.HISTORY, list.slice(0, HISTORY_MAX_ITEMS));
+  renderHistory();
+}
+
+function renderHistory() {
+  const box = $('#search-history');
+  if (!box) return;
+  const list = getHistory();
+  if (!list.length) { box.innerHTML = ''; return; }
+  const icons = { word: '📘', idiom: '🟣', sentence: '💬' };
+  box.innerHTML = '<div class="flex flex-wrap items-center gap-2">' +
+    '<span class="text-xs font-extrabold text-[#AFAFAF]">🕘 最近查詢</span>' +
+    list.map(function (x) {
+      return '<button class="duo-btn duo-btn-ghost duo-btn-sm" data-history="' + esc(x.key) + '">' +
+        (icons[x.type] || '📘') + ' ' + esc(x.label) + '</button>';
+    }).join('') +
+    '<button class="duo-btn duo-btn-ghost duo-btn-sm" id="btn-clear-history" title="清空最近查詢">🗑️ 清空</button>' +
+  '</div>';
+
+  $$('[data-history]', box).forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const input = $('#word-input');
+      if (input) input.value = btn.dataset.history;
+      handleSearch();
+    });
+  });
+  const clr = $('#btn-clear-history', box);
+  if (clr) {
+    clr.addEventListener('click', function () {
+      lsSet(LS_KEYS.HISTORY, []);
+      renderHistory();
+      showToast('🗑️ 已清空最近查詢紀錄。', 'info', 2500);
+    });
+  }
+}
+
 /* =================================================================================
    【模組二：每日單字測試（Daily Dynamic Quiz）】
    ================================================================================= */
 
-/** ★ 建立今日測驗題目：從「只有單字」的題庫池抽題，中文釋義一律即時連網取得 */
-async function buildDailyQuiz(onProgress) {
-  const candidates = shuffle(QUIZ_WORDS).slice(0, QUIZ_POOL_FETCH);
+/* ---------------------------------------------------------------------------------
+   ★ 模組四：每日單字訓練升級 —— 一天可以練「多於一次」
+   ---------------------------------------------------------------------------------
+   資料結構（localStorage key：daily_quiz_record）：
+     {
+       date: 'YYYY-MM-DD',
+       sessions: [ { id, questions, answers, score, completed, createdAt } ],
+       usedWords: [ '...' ],   ← 今天所有場次出過題的字（★ 動態排除機制的依據）
+       generatedBy: 'online'
+     }
+   ★ 動態排除機制：每次建立新場次時，一律排除 usedWords 裡的字，
+     因此後續場次抽到的單字「絕對不會與前幾次重複」。
+   --------------------------------------------------------------------------------- */
+
+/** 建立一份全新的今日紀錄（多輪次格式） */
+function newDailyRecord() {
+  return { date: todayKey(), sessions: [], usedWords: [], generatedBy: 'online' };
+}
+
+/**
+ * 相容舊格式：舊版只有單場次（{questions, answers, score}），
+ * 讀到時自動包成 sessions[0]，讓舊使用者的進度不會消失。
+ */
+function migrateDailyRecord(record) {
+  if (!record || typeof record !== 'object') return null;
+  if (Array.isArray(record.sessions)) return record;
+  if (Array.isArray(record.questions) && record.questions.length) {
+    return {
+      date: record.date || todayKey(),
+      sessions: [{
+        id: 1,
+        questions: record.questions,
+        answers: Array.isArray(record.answers) ? record.answers : [],
+        score: record.score || 0,
+        completed: !!record.completed,
+        createdAt: record.createdAt || Date.now()
+      }],
+      usedWords: record.questions.map(function (q) { return q.word; }),
+      generatedBy: record.generatedBy || 'online'
+    };
+  }
+  return null;
+}
+
+/** 取得目前進行中的場次（最後一場） */
+function currentSession(record) {
+  const rec = record || state.daily;
+  if (!rec || !Array.isArray(rec.sessions) || !rec.sessions.length) return null;
+  return rec.sessions[rec.sessions.length - 1];
+}
+
+/** 取得今天所有場次「已經出過題」的單字（聯集，唯讀） */
+function getUsedWords(record) {
+  const rec = record || state.daily;
+  if (!rec) return [];
+  const set = new Set(Array.isArray(rec.usedWords) ? rec.usedWords : []);
+  (rec.sessions || []).forEach(function (s) {
+    (s.questions || []).forEach(function (q) { if (q && q.word) set.add(q.word); });
+  });
+  return Array.from(set);
+}
+
+/** 今天還沒練過的單字 */
+function getRemainingWords(record) {
+  const used = new Set(getUsedWords(record).map(function (w) { return String(w).toLowerCase(); }));
+  return QUIZ_WORDS.filter(function (w) { return !used.has(w); });
+}
+
+/**
+ * ★ 建立「一個場次」的題目（不是整天的紀錄）
+ * @param {Function} onProgress 進度回報
+ * @param {string[]} excludeWords 今天已經出過題的字（★ 動態排除）
+ */
+async function buildDailyQuiz(onProgress, excludeWords) {
+  /* ★ 模組四核心：動態排除機制 —— 今天出過的字，這一場絕對不再抽 */
+  const used = new Set((excludeWords || []).map(function (w) { return String(w).toLowerCase(); }));
+  const available = QUIZ_WORDS.filter(function (w) { return !used.has(w); });
+  if (available.length < DAILY_QUIZ_SIZE) {
+    throw new Error('今天的題庫已經全部練完了（只剩 ' + available.length + ' 個沒練過的字）。' +
+                    '可以按「🗑️ 重置今日訓練」重新開始，或明天再來。');
+  }
+
+  const candidates = shuffle(available).slice(0, Math.min(QUIZ_POOL_FETCH, available.length));
   const meanings = await ensureMeanings(candidates, onProgress);
   const usable = candidates.filter(function (w) { return meanings[w]; });
-  // 去重後的釋義種類至少要有 4 種，才湊得出「4 選 1」且選項不重複
-  const distinctMeanings = Array.from(new Set(usable.map(function (w) { return meanings[w]; })));
-  if (distinctMeanings.length < 4) {
-    throw new Error('無法從線上翻譯服務取得足夠且相異的單字釋義（至少需要 4 種不同的釋義）');
+  if (usable.length < 4) {
+    throw new Error('線上翻譯服務目前只回傳了 ' + usable.length + ' 個可用釋義，不足以產生「4 選 1」題目。');
+  }
+
+  /* 干擾選項池：優先用本次抓到的釋義；不足時再從本機快取的釋義補齊 */
+  const pool = new Set(usable.map(function (w) { return meanings[w]; }));
+  if (pool.size < 9) {
+    QUIZ_WORDS.forEach(function (w) {
+      const cachedEntry = cacheGet(w);
+      const m = zhGet(w) || (cachedEntry ? cachedEntry.meaning : '');
+      if (m) pool.add(m);
+    });
+  }
+  const distractorPool = Array.from(pool).filter(Boolean);
+  if (distractorPool.length < 4) {
+    throw new Error('目前取得的相異中文釋義不足 4 種，無法組成「4 選 1」的選項。');
   }
 
   const picked = usable.slice(0, DAILY_QUIZ_SIZE);
   const questions = picked.map(function (w) {
-    const others = shuffle(usable.filter(function (x) { return x !== w; }));
     // 干擾選項必須跟正確答案不同，且彼此不重複（避免出現兩個一樣的選項）
     const seen = new Set([meanings[w]]);
     const distractors = [];
-    for (let i = 0; i < others.length && distractors.length < 3; i++) {
-      const m = meanings[others[i]];
+    const shuffledPool = shuffle(distractorPool);
+    for (let i = 0; i < shuffledPool.length && distractors.length < 3; i++) {
+      const m = shuffledPool[i];
       if (!m || seen.has(m)) continue;
       seen.add(m);
       distractors.push(m);
@@ -1983,41 +3146,48 @@ async function buildDailyQuiz(onProgress) {
       answerIndex: options.indexOf(meanings[w])
     };
   });
-  const record = {
-    date: todayKey(),
+
+  const nextId = (state.daily && Array.isArray(state.daily.sessions)) ? state.daily.sessions.length + 1 : 1;
+  return {
+    id: nextId,
     questions: questions,
-    answers: [],       // { word, chosenIndex, chosenMeaning, correct }
+    answers: [],       // { word, chosenIndex, chosenMeaning, correctMeaning, correct }
     score: 0,
     completed: false,
+    createdAt: Date.now(),
     generatedBy: 'online'   // 題目與釋義全部來自即時連網查詢
   };
-  lsSet(LS_KEYS.DAILY, record);
-  return record;
 }
 
 /** 取得今天「已經存在」的測驗紀錄；尚未建立則回傳 null（交由 renderQuiz 連網生成） */
 function getStoredDailyRecord() {
-  const record = lsGet(LS_KEYS.DAILY, null);
-  if (!record || record.date !== todayKey() || !Array.isArray(record.questions) || record.questions.length === 0) {
-    return null;
-  }
+  const record = migrateDailyRecord(lsGet(LS_KEYS.DAILY, null));
+  if (!record || record.date !== todayKey()) return null;
+  if (!Array.isArray(record.sessions) || !record.sessions.length) return null;
   return record;
 }
 
-/** 儲存每日測驗紀錄 */
+/** 儲存每日測驗紀錄（同時更新「今天已出過題的字」清單） */
 function saveDailyRecord() {
-  if (state.daily) lsSet(LS_KEYS.DAILY, state.daily);
+  if (!state.daily) return;
+  state.daily.usedWords = getUsedWords(state.daily);
+  lsSet(LS_KEYS.DAILY, state.daily);
 }
 
 /** 建立「正在連網生成題目」的載入畫面 */
-function quizLoadingHtml() {
+function quizLoadingHtml(roundNo, usedCount) {
+  const round = (roundNo && roundNo > 1) ? roundNo : 1;
+  const title = (round > 1) ? ('正在連線產生第 ' + round + ' 輪題目…') : '正在連線產生今天的題目…';
+  const note = (usedCount && usedCount > 0)
+    ? ('★ 已自動排除今天練過的 ' + usedCount + ' 個字，這一輪絕對不會重複出題。')
+    : '題目的中文釋義需要即時向線上翻譯服務取得（第一次最慢，之後會走本機快取）。';
   return '' +
     '<div class="duo-card p-5 sm:p-6 animate-fade">' +
       '<div class="flex items-center gap-3 mb-4">' +
         '<div class="text-3xl animate-bounce">📡</div>' +
         '<div>' +
-          '<p class="font-extrabold text-lg">正在連線產生今天的題目…</p>' +
-          '<p class="text-sm font-bold text-[#AFAFAF]">題目的中文釋義需要即時向線上翻譯服務取得（第一次最慢，之後會走本機快取）。</p>' +
+          '<p class="font-extrabold text-lg">' + title + '</p>' +
+          '<p class="text-sm font-bold text-[#AFAFAF]">' + note + '</p>' +
         '</div>' +
       '</div>' +
       '<p id="quiz-loading-progress" class="text-xs font-extrabold text-[#1CB0F6] mb-4">正在準備單字釋義…</p>' +
@@ -2041,7 +3211,7 @@ function quizErrorHtml(message) {
     '</div>';
 }
 
-/** 渲染整個測驗分頁（★ 今天還沒有題目時，即時連網生成） */
+/** 渲染整個測驗分頁（★ 今天還沒有紀錄時，即時連網生成第 1 輪） */
 async function renderQuiz() {
   const box = $('#quiz-body');
   if (!box) return;
@@ -2049,53 +3219,123 @@ async function renderQuiz() {
   const stored = getStoredDailyRecord();
   if (stored) {
     state.daily = stored;
+    const s = currentSession(state.daily);
+    state.quizSessionNo = s ? s.id : 1;
     paintQuiz();
     return;
   }
+
+  if (!state.daily || state.daily.date !== todayKey()) state.daily = newDailyRecord();
+  if (!state.daily.sessions.length) {
+    await startNewSession();
+  } else {
+    paintQuiz();
+  }
+}
+
+/**
+ * ★ 模組四：開始新的一輪訓練
+ * 一天可以練很多輪；每一輪都會自動排除「今天已經出過題」的單字。
+ */
+async function startNewSession() {
+  const box = $('#quiz-body');
+  if (!box) return;
   if (state.quizLoading) return;
+  if (!state.daily || state.daily.date !== todayKey()) state.daily = newDailyRecord();
+
+  const used = getUsedWords(state.daily);
+  const remaining = getRemainingWords(state.daily);
+  const roundNo = state.daily.sessions.length + 1;
+
+  if (remaining.length < DAILY_QUIZ_SIZE) {
+    state.quizSessionNo = roundNo;
+    updateProgressBar(0);
+    box.innerHTML = quizPoolEmptyHtml(remaining.length, roundNo);
+    bindPoolEmptyEvents();
+    return;
+  }
 
   state.quizLoading = true;
-  state.daily = null;
+  state.quizSessionNo = roundNo;
   updateProgressBar(0);
-  box.innerHTML = quizLoadingHtml();
+  box.innerHTML = quizLoadingHtml(roundNo, used.length);
 
   try {
-    const rec = await buildDailyQuiz(function (done, total) {
+    const session = await buildDailyQuiz(function (done, total) {
       const el = $('#quiz-loading-progress');
       if (el) el.textContent = '已取得 ' + done + ' / ' + total + ' 個單字的繁體中文釋義…';
-    });
-    state.daily = rec;
+    }, used);
+    state.daily.sessions.push(session);
+    state.quizSessionNo = session.id;
+    saveDailyRecord();       // 同時更新 usedWords（★ 下一輪動態排除的依據）
     updateCacheStatus();
     paintQuiz();
   } catch (err) {
     console.error('產生題目失敗：', err);
     box.innerHTML = quizErrorHtml((err && err.message) ? err.message : '未知錯誤');
     const retry = $('#quiz-retry');
-    if (retry) retry.addEventListener('click', function () { renderQuiz(); });
+    if (retry) retry.addEventListener('click', function () { startNewSession(); });
   } finally {
     state.quizLoading = false;
   }
 }
 
-/** 繪製目前這一份每日測驗（同步） */
+/** 今天的題庫池已經練完（剩餘字數湊不滿一輪）時的畫面 */
+function quizPoolEmptyHtml(remaining, roundNo) {
+  const finished = Math.max(0, (roundNo || 1) - 1);
+  return '' +
+    '<div class="duo-card p-6 sm:p-8 text-center animate-pop">' +
+      '<div class="text-6xl mb-3">🏁</div>' +
+      '<h2 class="text-2xl sm:text-3xl font-extrabold mb-2">今天的題庫全部練完了！</h2>' +
+      '<p class="font-extrabold text-[#AFAFAF] mb-2">你今天已經完成 ' + finished + ' 輪訓練，' +
+        '只剩下 ' + remaining + ' 個沒練過的字（不滿 ' + DAILY_QUIZ_SIZE + ' 題，無法再開一輪）。</p>' +
+      '<p class="text-sm font-bold text-[#AFAFAF] mb-6">為了確保「同一天絕不重複出題」，系統不會再抽已經練過的字。<br>明天會自動開啟全新的一輪。</p>' +
+      '<div class="flex flex-col sm:flex-row gap-3">' +
+        '<button class="duo-btn duo-btn-blue flex-1" id="btn-quiz-go-srs">🧠 前往錯題本</button>' +
+        '<button class="duo-btn duo-btn-ghost flex-1" id="btn-quiz-reset-today">🗑️ 重置今日訓練</button>' +
+      '</div>' +
+    '</div>';
+}
+
+/** 綁定「題庫練完」畫面上的按鈕 */
+function bindPoolEmptyEvents() {
+  const goSrs = $('#btn-quiz-go-srs');
+  if (goSrs) goSrs.addEventListener('click', function () { switchTab('srs'); });
+
+  const reset = $('#btn-quiz-reset-today');
+  if (reset) reset.addEventListener('click', function () {
+    if (!window.confirm('確定要重置今天的訓練紀錄嗎？今天的輪次與分數會歸零（錯題本不受影響），重置後可以重新抽全部的字。')) return;
+    state.daily = newDailyRecord();
+    lsSet(LS_KEYS.DAILY, state.daily);
+    state.quizSessionNo = 0;
+    updateProgressBar(0);
+    startNewSession();
+  });
+}
+
+/** 繪製目前這一輪的每日測驗（同步） */
 function paintQuiz() {
   const box = $('#quiz-body');
   const rec = state.daily;
   if (!box || !rec) return;
-  const total = quizSize(rec);
-  const answeredCount = rec.answers.length;
+  const session = currentSession(rec);
+  if (!session) return;
+
+  const total = quizSize(session);
+  const answeredCount = session.answers.length;
+  const roundNo = session.id || rec.sessions.length;
 
   // 更新進度條（畫面上方的綠色進度條）
   const progressPct = Math.round((answeredCount / total) * 100);
   updateProgressBar(progressPct);
 
-  if (rec.completed) {
+  if (session.completed) {
     renderQuizResult();
     return;
   }
 
-  const q = rec.questions[answeredCount];
-  const selected = rec.pendingSelection; // 尚未送出的選項
+  const q = session.questions[answeredCount];
+  const selected = session.pendingSelection; // 尚未送出的選項
 
   const optionsHtml = q.options.map((opt, i) => {
     const sel = (selected === i) ? ' selected' : '';
@@ -2106,12 +3346,23 @@ function paintQuiz() {
       '</button>';
   }).join('');
 
+  /* ★ 模組四：今天其他輪次的成績小卡 */
+  const prevSessions = rec.sessions.filter(function (s) { return s.id !== session.id; });
+  const historyStrip = (prevSessions.length === 0) ? '' :
+    '<div class="flex flex-wrap items-center gap-2 mb-3">' +
+      '<span class="text-xs font-extrabold text-[#AFAFAF]">今天的其他輪次：</span>' +
+      prevSessions.map(function (s) {
+        return '<span class="stat-chip">第 ' + s.id + ' 輪 ' + s.score + ' / ' + quizSize(s) + '</span>';
+      }).join('') +
+    '</div>';
+
   box.innerHTML = '' +
     '<div class="duo-card p-5 sm:p-6 mb-5 animate-fade">' +
       '<div class="flex items-center justify-between mb-3 flex-wrap gap-2">' +
-        '<span class="text-sm font-extrabold text-[#AFAFAF]">今日進度 ' + Math.min(answeredCount + 1, total) + ' / ' + total + '</span>' +
-        '<span class="stat-chip">✅ 目前得分 ' + rec.score + ' 分</span>' +
+        '<span class="text-sm font-extrabold text-[#AFAFAF]">今日第 ' + roundNo + ' 輪 ・ 本輪進度 ' + Math.min(answeredCount + 1, total) + ' / ' + total + '</span>' +
+        '<span class="stat-chip">✅ 本輪得分 ' + session.score + ' 分</span>' +
       '</div>' +
+      historyStrip +
       '<div class="progress-track mb-5"><div class="progress-fill" id="quiz-progress-fill"></div></div>' +
 
       '<p class="text-xs font-extrabold text-[#AFAFAF] mb-2">第 ' + (answeredCount + 1) + ' 題：請選出最正確的繁體中文釋義</p>' +
@@ -2121,7 +3372,7 @@ function paintQuiz() {
       '</div>' +
       '<div class="space-y-3">' + optionsHtml + '</div>' +
     '</div>' +
-    '<p class="text-center text-xs font-bold text-[#AFAFAF]">📅 每天只有一次正式測驗機會，錯的單字會自動進入錯題本。</p>';
+    '<p class="text-center text-xs font-bold text-[#AFAFAF]">🔁 今天可以練很多輪，每一輪都不會抽到重複的字；錯的單字會自動進入錯題本。</p>';
 
   // 重新套用進度條寬度（因為 DOM 重建了）
   updateProgressBar(progressPct);
@@ -2129,10 +3380,7 @@ function paintQuiz() {
   // 選項點擊
   $$('[data-option]', box).forEach(btn => {
     btn.addEventListener('click', () => {
-      if (state.daily.pendingSelection !== undefined && state.daily.pendingSelection !== null) {
-        // 已送出就不可能發生，這裡僅為保險
-      }
-      state.daily.pendingSelection = Number(btn.dataset.option);
+      session.pendingSelection = Number(btn.dataset.option);
       $$('[data-option]', box).forEach(b => b.classList.toggle('selected', b === btn));
       updateCheckButtonState();
     });
@@ -2149,7 +3397,7 @@ function paintQuiz() {
     title: '選好答案了嗎？',
     sub: '選一個你最有把握的選項，然後按下檢查答案。',
     actionLabel: '檢查答案',
-    actionDisabled: (state.daily.pendingSelection === undefined || state.daily.pendingSelection === null),
+    actionDisabled: (session.pendingSelection === undefined || session.pendingSelection === null),
     onAction: checkQuizAnswer
   });
 }
@@ -2158,16 +3406,19 @@ function paintQuiz() {
 function updateCheckButtonState() {
   const btn = $('#fb-action');
   if (!btn) return;
-  const ready = state.daily && state.daily.pendingSelection !== undefined && state.daily.pendingSelection !== null;
+  const session = currentSession(state.daily);
+  const ready = !!session && session.pendingSelection !== undefined && session.pendingSelection !== null;
   btn.disabled = !ready;
 }
 
 /** 檢查答案（核心：答錯立刻寫入錯題本） */
 function checkQuizAnswer() {
   const rec = state.daily;
-  const qIndex = rec.answers.length;
-  const q = rec.questions[qIndex];
-  const chosen = rec.pendingSelection;
+  const session = currentSession(rec);
+  if (!session) return;
+  const qIndex = session.answers.length;
+  const q = session.questions[qIndex];
+  const chosen = session.pendingSelection;
 
   if (chosen === undefined || chosen === null) {
     showToast('✏️ 請先選擇一個答案！', 'warn', 3000);
@@ -2175,23 +3426,23 @@ function checkQuizAnswer() {
   }
 
   const isCorrect = (chosen === q.answerIndex);
-  rec.answers.push({
+  session.answers.push({
     word: q.word,
     chosenIndex: chosen,
     chosenMeaning: q.options[chosen],
     correctMeaning: q.correctMeaning,
     correct: isCorrect
   });
-  if (isCorrect) rec.score += 1;
+  if (isCorrect) session.score += 1;
 
   /* ★ 錯題捕捉機制：答錯時「立刻」寫入 localStorage 的 wrong_words_db */
   if (!isCorrect) {
     addWrongWord(q.word, { meaning: q.correctMeaning });
   }
 
-  rec.pendingSelection = null;
+  session.pendingSelection = null;
   saveDailyRecord();
-  updateProgressBar(Math.round((rec.answers.length / quizSize(rec)) * 100));
+  updateProgressBar(Math.round((session.answers.length / quizSize(session)) * 100));
 
   // 標示選項正確／錯誤
   $$('[data-option]').forEach(btn => {
@@ -2202,15 +3453,18 @@ function checkQuizAnswer() {
     if (idx === chosen && !isCorrect) btn.classList.add('wrong');
   });
 
-  const isLast = (rec.answers.length >= quizSize(rec));
+  const isLast = (session.answers.length >= quizSize(session));
+  const roundNo = session.id || rec.sessions.length;
+  const lastLabel = isLast ? ('查看第 ' + roundNo + ' 輪成績') : '繼續';
+  const todayDone = getUsedWords(rec).length;
 
   if (isCorrect) {
     showFeedbackBar({
       type: 'correct',
       icon: '✨',
       title: '太棒了！答對了！',
-      sub: '正確答案：' + q.correctMeaning,
-      actionLabel: isLast ? '查看今日成績' : '繼續',
+      sub: '正確答案：' + q.correctMeaning + '　（今天已練過 ' + todayDone + ' 個字）',
+      actionLabel: lastLabel,
       onAction: continueQuiz
     });
     playBounce();
@@ -2220,20 +3474,22 @@ function checkQuizAnswer() {
       icon: '❌',
       title: '正確答案是：' + q.correctMeaning,
       sub: '沒關係，失敗是成功的基石！「' + q.word + '」已立刻存入錯題本，7 天後我們再來一次。',
-      actionLabel: isLast ? '查看今日成績' : '繼續',
+      actionLabel: lastLabel,
       onAction: continueQuiz
     });
     playShake();
   }
 }
 
-/** 進入下一題或完成測驗 */
+/** 進入下一題或結束本輪 */
 function continueQuiz() {
   const rec = state.daily;
-  if (rec.answers.length >= quizSize(rec)) {
-    rec.completed = true;
+  const session = currentSession(rec);
+  if (!session) return;
+  if (session.answers.length >= quizSize(session)) {
+    session.completed = true;
     saveDailyRecord();
-    bumpQuizStats();       // 更新「連續天數」與「完成測驗次數」
+    bumpQuizStats();       // 更新「連續天數」與「完成測驗次數」（同一天多輪只算一次）
     updateLearningStats();
     hideFeedbackBar();
     renderQuizResult();
@@ -2242,30 +3498,48 @@ function continueQuiz() {
     return;
   }
   saveDailyRecord();
-  renderQuiz();
+  paintQuiz();
 }
 
-/** 查詢某單字今日是否被答錯（用於完成畫面） */
+/** 查詢今日「所有輪次」答錯的單字（同一字去重，保留最後一次的紀錄） */
 function getTodayWrongList() {
   const rec = state.daily;
-  if (!rec) return [];
-  return rec.answers.filter(a => !a.correct);
+  if (!rec || !Array.isArray(rec.sessions)) return [];
+  const map = new Map();
+  rec.sessions.forEach(function (s) {
+    (s.answers || []).forEach(function (a) { if (!a.correct) map.set(a.word, a); });
+  });
+  return Array.from(map.values());
 }
 
-/** 渲染今日成績畫面 */
+/** 渲染本輪成績畫面（★ 模組四：同一天可多輪，因此同時顯示今日累計） */
 function renderQuizResult() {
   const rec = state.daily;
-  const wrongs = getTodayWrongList();
-  const total = quizSize(state.daily);
-  const score = rec.score;
-  const emoji = score === total ? '🏆' : (score >= 3 ? '🎉' : '💪');
+  const session = currentSession(rec);
+  if (!rec || !session) return;
+
+  const total = quizSize(session);
+  const score = session.score;
+  const roundNo = session.id || rec.sessions.length;
+
+  const wrongs = (session.answers || []).filter(a => !a.correct);
+  const todayWrongs = getTodayWrongList();
+
+  /* 今日累計（跨所有輪次） */
+  const todayQuestions = rec.sessions.reduce(function (n, s) { return n + quizSize(s); }, 0);
+  const todayScore = rec.sessions.reduce(function (n, s) { return n + (s.score || 0); }, 0);
+  const practiced = getUsedWords(rec).length;
+  const remaining = getRemainingWords(rec);
+  const canAnother = remaining.length >= DAILY_QUIZ_SIZE;
+
+  const emoji = score === total ? '🏆' : (score >= Math.ceil(total / 2) ? '🎉' : '💪');
   const praise =
-    score === total ? '完美滿分！你根本是行走的字典！' :
-    score >= 3      ? '很不錯喔！再練一下就更強了！' :
-                      '別灰心，錯題本會幫你把它們全部收服！';
+    score === total               ? '完美滿分！這一輪你根本是行走的字典！' :
+    score >= Math.ceil(total / 2) ? '很不錯喔！再練一輪就更強了！' :
+                                    '別灰心，錯題本會幫你把它們全部收服！';
 
   const wrongHtml = wrongs.length === 0
-    ? '<div class="p-4 rounded-2xl bg-[#D7FFB7] border-2 border-[#A5ED6E] font-extrabold text-[#4CA30A] text-center">🎊 今天零錯題，太神啦！</div>'
+    ? '<div class="p-4 rounded-2xl bg-[#D7FFB7] border-2 border-[#A5ED6E] font-extrabold text-[#4CA30A] text-center">🎊 這一輪零錯題，太神啦！</div>'
     : '<ul class="space-y-3">' + wrongs.map(a =>
         '<li class="p-4 rounded-2xl bg-[#FFDFE0] border-2 border-[#FF9AA0] flex flex-wrap items-center gap-2 justify-between">' +
           '<div>' +
@@ -2276,49 +3550,70 @@ function renderQuizResult() {
           '<span class="text-xs font-extrabold px-3 py-1 rounded-full bg-white border-2 border-[#FF9AA0] text-[#EA2B2B]">已進入錯題本</span>' +
         '</li>').join('') + '</ul>';
 
+  /* 今天每一輪的成績徽章 */
+  const roundsHtml = rec.sessions.map(function (s) {
+    const isNow = (s.id === session.id);
+    return '<span class="stat-chip"' + (isNow ? ' style="border-color:#1CB0F6"' : '') + '>' +
+      (isNow ? '★ ' : '') + '第 ' + s.id + ' 輪 ' + s.score + ' / ' + quizSize(s) + '</span>';
+  }).join('');
+
+  const anotherBtn = canAnother
+    ? '<button class="duo-btn flex-1" id="btn-quiz-another">🔁 再來一輪（還有 ' + remaining.length + ' 個新字）</button>'
+    : '<button class="duo-btn flex-1" id="btn-quiz-another" disabled>🏁 今天的新字都練完了</button>';
+
   $('#quiz-body').innerHTML = '' +
     '<div class="duo-card p-6 sm:p-8 text-center animate-pop">' +
       '<div class="text-6xl mb-3">' + emoji + '</div>' +
-      '<h2 class="text-2xl sm:text-3xl font-extrabold mb-2">今日測驗已完成！</h2>' +
+      '<h2 class="text-2xl sm:text-3xl font-extrabold mb-2">第 ' + roundNo + ' 輪完成！</h2>' +
       '<p class="font-extrabold text-[#AFAFAF] mb-5">' + praise + '</p>' +
-      '<div class="inline-flex items-baseline gap-2 px-6 py-4 rounded-2xl bg-[#D7FFB7] border-2 border-[#A5ED6E] mb-6">' +
+      '<div class="inline-flex items-baseline gap-2 px-6 py-4 rounded-2xl bg-[#D7FFB7] border-2 border-[#A5ED6E] mb-4">' +
         '<span class="text-4xl font-extrabold text-[#4CA30A]">' + score + '</span>' +
         '<span class="text-xl font-extrabold text-[#4CA30A]">/ ' + total + '</span>' +
       '</div>' +
-      '<p class="text-sm font-bold text-[#AFAFAF] mb-6">📅 ' + esc(rec.date) + ' ・ 明天再來挑戰新的 5 個單字！</p>' +
+      '<p class="text-sm font-bold text-[#AFAFAF] mb-3">📅 ' + esc(rec.date) + ' ・ 今天已完成 ' + rec.sessions.length +
+        ' 輪，累計 ' + todayScore + ' / ' + todayQuestions + ' 分</p>' +
+      '<div class="flex flex-wrap gap-2 justify-center mb-5">' + roundsHtml + '</div>' +
+      '<p class="text-xs font-extrabold text-[#AFAFAF] mb-6">★ 動態排除機制：今天已經練過 ' + practiced + ' 個字，' +
+        '再開一輪也絕對不會重複抽到它們。今天還剩 ' + remaining.length + ' 個沒練過的字。</p>' +
       '<div class="divider mb-6"></div>' +
-      '<h4 class="font-extrabold text-lg mb-3 text-left">❌ 今日答錯的單字</h4>' +
+      '<h4 class="font-extrabold text-lg mb-3 text-left">❌ 這一輪答錯的單字</h4>' +
       '<div class="text-left">' + wrongHtml + '</div>' +
       '<div class="flex flex-col sm:flex-row gap-3 mt-7">' +
+        anotherBtn +
         '<button class="duo-btn duo-btn-blue flex-1" id="btn-go-srs">🧠 前往錯題本看倒數</button>' +
-        '<button class="duo-btn duo-btn-ghost flex-1" id="btn-review-wrong-now">🔁 立刻重練今日錯題</button>' +
       '</div>' +
+      '<div class="mt-3"><button class="duo-btn duo-btn-ghost w-full" id="btn-review-wrong-now">🔁 立刻重練今日錯題（' + todayWrongs.length + ' 個）</button></div>' +
     '</div>';
 
   updateProgressBar(100);
+
+  const another = $('#btn-quiz-another');
+  if (another && !another.disabled) another.addEventListener('click', function () { startNewSession(); });
 
   const goSrs = $('#btn-go-srs');
   if (goSrs) goSrs.addEventListener('click', () => switchTab('srs'));
 
   const redoBtn = $('#btn-review-wrong-now');
   if (redoBtn) redoBtn.addEventListener('click', () => {
-    if (wrongs.length === 0) {
+    if (todayWrongs.length === 0) {
       showToast('🎊 今天沒有錯題，不需要重練啦！', 'info', 3500);
       return;
     }
-    startQuickRedo(wrongs.map(w => w.word));
+    startQuickRedo(todayWrongs.map(w => w.word));
   });
 }
 
 /** 今日錯題即時重練（不影響 7 天排程，僅為練習） */
 function startQuickRedo(words) {
   const q = words[0];
+  const cached = cacheGet(q);
   const builtIn = findBuiltInWord(q);
+  const meaning = zhGet(q) || (cached && cached.meaning) || (builtIn && builtIn.meaning) || '（這個字目前沒有可用的釋義快取）';
   showFeedbackBar({
     type: 'neutral',
     icon: '🔁',
     title: '即時重練：「' + q + '」',
-    sub: builtIn ? builtIn.meaning : '這個字目前沒有內建釋義。',
+    sub: meaning,
     actionLabel: '我知道啦',
     onAction: () => {
       hideFeedbackBar();
@@ -2955,9 +4250,16 @@ function init() {
 
   // 查詢事件（即時連網查詢）
   $('#btn-search').addEventListener('click', handleSearch);
-  $('#word-input').addEventListener('keydown', e => {
+  const input = $('#word-input');
+  input.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); handleSearch(); }
   });
+
+  /* ★ 模組三：輸入的同時就即時感應並主動呈現拆字解釋（延遲 320ms、本機運算、零流量） */
+  input.addEventListener('input', scheduleLiveAnalysis);
+
+  // 最近查詢紀錄
+  renderHistory();
 
   // 連線狀態列
   updateNetStatus();
@@ -2992,11 +4294,16 @@ function init() {
   updateLearningStats();
   updateSrsBadge();
 
-  // 每日測驗：今天若已有題目就直接載入；沒有則先顯示「連網生成中」畫面（不阻塞首頁）
+  // 每日測驗：今天若已有紀錄就直接載入；沒有則先顯示「連網生成中」畫面（不阻塞首頁）
   state.daily = getStoredDailyRecord();
   if (!state.daily) {
+    state.daily = newDailyRecord();
+    state.quizSessionNo = 1;
     const qb = $('#quiz-body');
-    if (qb) qb.innerHTML = quizLoadingHtml();
+    if (qb) qb.innerHTML = quizLoadingHtml(1, 0);
+  } else {
+    const s0 = currentSession(state.daily);
+    state.quizSessionNo = s0 ? s0.id : 1;
   }
 
   // 啟動倒數計時器
